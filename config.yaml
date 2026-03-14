@@ -1,0 +1,52 @@
+# Thumpers GM Dashboard — Configuration
+
+# Your Yahoo Fantasy team number
+my_team_number: 10
+my_team_name: "Thumpers"
+total_teams: 12
+
+# NHL season
+season_id: 20252026
+
+# Categories (skaters only — no goalies)
+categories:
+  - G
+  - A
+  - FOW
+  - PIM
+  - PP
+  - S
+  - HIT
+  - BLK
+
+# Category weights for Z-score totals.
+# Set to 0.0 to punt a category, 0.5 to half-weight, 1.0 for full.
+weights:
+  G:   1.0
+  A:   1.0
+  FOW: 1.0
+  PIM: 1.0
+  PP:  1.0
+  S:   1.0
+  HIT: 1.0
+  BLK: 1.0
+
+# Z-score universe size (top N players by points used for mean/std)
+universe_size: 350
+
+# VORP replacement baselines
+vorp:
+  forward_rank: 180   # 180th forward by total_z
+  defense_rank: 80    # 80th defenseman by total_z
+
+# Drop suggestion threshold:
+# FA_value_score - Rostered_value_score > threshold => flag as "Recommended Drop"
+drop_threshold: 0.5
+
+# Schedule density windows (days)
+schedule_windows:
+  short: 7
+  long:  14
+
+# Cache TTL in hours
+cache_ttl_hours: 4
