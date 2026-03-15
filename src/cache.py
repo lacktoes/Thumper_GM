@@ -52,11 +52,13 @@ def init_players_db():
         """)
         con.execute("""
             CREATE TABLE IF NOT EXISTS game_logs (
-                player_id   INTEGER,
-                game_date   TEXT,
-                G  REAL, A REAL, PP REAL, S REAL, PIM REAL,
-                fetched_at  TEXT,
-                PRIMARY KEY (player_id, game_date)
+                player_id  INTEGER,
+                game_id    INTEGER,
+                game_date  TEXT,
+                G   REAL, A REAL, PIM REAL, PP REAL,
+                S   REAL, HIT REAL, BLK REAL, FOW REAL,
+                fetched_at TEXT,
+                PRIMARY KEY (player_id, game_id)
             )
         """)
 
@@ -136,39 +138,42 @@ def roster_stale(ttl_hours: int = 4) -> bool:
 
 # ── Game logs (recent form + injury detection) ────────────────────────────────
 
-def save_game_logs(logs: dict[int, list[dict]]):
-    """logs = {player_id: [{game_date, G, A, PP, S, PIM}]}"""
+def save_game_logs(rows: list[dict]):
+    """
+    Upsert per-game stats rows.
+    rows: [{player_id, game_id, game_date, G, A, PIM, PP, S, HIT, BLK}]
+    """
     now = datetime.now(timezone.utc).isoformat()
-    rows = [
-        {**game, "player_id": pid, "fetched_at": now}
-        for pid, games in logs.items()
-        for game in games
-    ]
     with _players_conn() as con:
-        pids = list(logs.keys())
-        if pids:
-            con.execute(
-                f"DELETE FROM game_logs WHERE player_id IN ({','.join('?'*len(pids))})",
-                pids,
-            )
         con.executemany("""
             INSERT OR REPLACE INTO game_logs
-              (player_id, game_date, G, A, PP, S, PIM, fetched_at)
-            VALUES (:player_id, :game_date, :G, :A, :PP, :S, :PIM, :fetched_at)
-        """, rows)
+              (player_id, game_id, game_date, G, A, PIM, PP, S, HIT, BLK, FOW, fetched_at)
+            VALUES
+              (:player_id,:game_id,:game_date,:G,:A,:PIM,:PP,:S,:HIT,:BLK,:FOW,:fetched_at)
+        """, [{**r, "fetched_at": now} for r in rows])
 
 
-def load_game_logs(player_ids: list[int] | None = None) -> dict[int, list[dict]]:
-    """Returns {player_id: [game_dicts sorted by date asc]}."""
+def load_game_logs(player_ids: list[int] | None = None,
+                   since_date: str | None = None) -> dict[int, list[dict]]:
+    """
+    Returns {player_id: [game_dicts sorted by game_date asc]}.
+    Optionally filter to player_ids and/or since_date.
+    """
+    clauses, params = [], []
+    if player_ids:
+        ph = ",".join("?" * len(player_ids))
+        clauses.append(f"player_id IN ({ph})")
+        params.extend(player_ids)
+    if since_date:
+        clauses.append("game_date >= ?")
+        params.append(since_date)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _players_conn() as con:
-        if player_ids:
-            ph   = ",".join("?" * len(player_ids))
-            rows = con.execute(
-                f"SELECT * FROM game_logs WHERE player_id IN ({ph}) ORDER BY game_date",
-                player_ids,
-            ).fetchall()
-        else:
-            rows = con.execute("SELECT * FROM game_logs ORDER BY game_date").fetchall()
+        rows = con.execute(
+            f"SELECT * FROM game_logs {where} ORDER BY game_date",
+            params,
+        ).fetchall()
 
     result: dict[int, list[dict]] = {}
     for r in rows:
@@ -179,18 +184,20 @@ def load_game_logs(player_ids: list[int] | None = None) -> dict[int, list[dict]]
     return result
 
 
-def game_logs_stale(player_ids: list[int], ttl_hours: int = 4) -> bool:
-    if not player_ids:
-        return False
+def latest_game_log_date() -> str | None:
+    """Return the most recent game_date stored in game_logs, or None."""
     with _players_conn() as con:
-        ph  = ",".join("?" * len(player_ids))
-        row = con.execute(
-            f"SELECT fetched_at FROM game_logs WHERE player_id IN ({ph}) LIMIT 1",
-            player_ids,
-        ).fetchone()
-    if not row:
+        row = con.execute("SELECT MAX(game_date) AS d FROM game_logs").fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def game_logs_need_update(ttl_hours: int = 4) -> bool:
+    """True if the game_logs table is empty or last fetched_at is older than ttl."""
+    with _players_conn() as con:
+        row = con.execute("SELECT MAX(fetched_at) AS t FROM game_logs").fetchone()
+    if not row or not row["t"]:
         return True
-    age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["fetched_at"])).total_seconds() / 3600
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["t"])).total_seconds() / 3600
     return age > ttl_hours
 
 

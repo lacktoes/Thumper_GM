@@ -17,13 +17,14 @@ import numpy as np
 import pandas as pd
 
 from .schedule import games_in_window, game_dates_in_window, light_nights
-from .nhl_api  import detect_missed_games, GAMELOG_CATS
+from .nhl_api  import detect_missed_games
 
 CATS = ["G", "A", "FOW", "PIM", "PP", "S", "HIT", "BLK"]
-# Categories available per-game from the NHL API game log
-GAMELOG_AVAIL = ["G", "A", "PP", "S", "PIM"]
-# Categories estimated from season per-game rate (not available per-game)
-GAMELOG_RATE  = ["HIT", "BLK", "FOW"]
+
+# All 8 categories available per-game from the 3 isGame=true endpoints:
+#   summary (G, A, PP, S, PIM) + realtime (HIT, BLK) + faceoffwins (FOW)
+GAMELOG_AVAIL = ["G", "A", "PP", "S", "PIM", "HIT", "BLK", "FOW"]
+GAMELOG_RATE  = []   # nothing needs a season-rate fallback
 
 # Injury status codes considered "active concern" (show warning badge)
 INJURY_WARN_CODES = {"IR", "IR-LT", "IL", "O", "DTD", "Q", "GTD"}
@@ -149,16 +150,11 @@ def add_recent_form(
         recent = [g for g in log if g.get("game_date", "") >= cutoff]
         rgp    = len(recent)
 
-        # Per-game averages for available cats
+        # Per-game averages for all 8 categories (all available from game log)
         pg_avail = {}
         for cat in GAMELOG_AVAIL:
             total = sum(g.get(cat, 0) for g in recent)
             pg_avail[cat] = total / rgp if rgp > 0 else 0.0
-
-        # Rate-based fallback for HIT, BLK, FOW (season average per game)
-        gp = max(row.get("gp", 1), 1)
-        for cat in GAMELOG_RATE:
-            pg_avail[cat] = float(row.get(cat, 0)) / gp
 
         recent_rows[pid] = {"recent_gp": rgp, **{f"{cat}_rpg": v for cat, v in pg_avail.items()}}
 

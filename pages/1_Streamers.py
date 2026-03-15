@@ -90,7 +90,7 @@ st.dataframe(
 st.caption(
     f"Ranked by **Value (7d)** = Z-score × schedule density (next {short_w} days).  \n"
     "**Z (Recent)** uses last "
-    f"{st.session_state.get('recent_days', 14)} days — G, A, PP, S, PIM only (HIT/BLK/FOW from season rate).  \n"
+    f"{st.session_state.get('recent_days', 14)} days — all 8 categories per game.  \n"
     "⭐ = light night (< 5 total NHL games). Injured players hidden by default."
 )
 

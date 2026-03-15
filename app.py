@@ -25,9 +25,10 @@ from src.cache        import (
     save_skaters,    load_skaters,    skaters_stale,
     save_schedule,   load_schedule,   schedule_stale,
     save_roster_membership, load_roster_membership, roster_stale,
-    save_game_logs,  load_game_logs,  game_logs_stale,
+    save_game_logs,  load_game_logs,
+    latest_game_log_date, game_logs_need_update,
 )
-from src.nhl_api      import fetch_skaters, fetch_game_logs
+from src.nhl_api      import fetch_skaters, fetch_per_game_stats, SEASON_START
 from src.schedule     import fetch_schedule
 from src.yahoo_fantasy import fetch_all_rosters, build_roster_membership
 from src.analytics    import build_player_df
@@ -90,7 +91,7 @@ with st.sidebar:
     refresh_schedule = col_b.button("📅 Schedule", help="Refresh NHL schedule")
     col_c, col_d = st.columns(2)
     refresh_roster   = col_c.button("👥 Roster",   help="Sync Yahoo Fantasy rosters + injury status")
-    refresh_logs     = col_d.button("📈 Form",     help="Refresh game logs for top players")
+    refresh_logs     = col_d.button("📈 Form",     help="Fetch new per-game stats since last update")
 
 # ── Data refresh ──────────────────────────────────────────────────────────────
 
@@ -141,48 +142,54 @@ if refresh_roster or roster_stale(cfg["cache_ttl_hours"]):
         st.warning(f"Yahoo roster sync failed: {exc}")
         yahoo_ok = False
 
-# 4. Game logs (NHL Web API) — for priority players
-def _priority_player_ids(skaters: list, roster: dict, top_n: int = 40) -> list[int]:
-    """My roster + top N FAs by season points."""
-    my_team   = cfg["my_team_number"]
-    my_ids    = [s["player_id"] for s in skaters
-                 if roster.get(s["player_id"], {}).get("team_number") == my_team]
-    fa_sorted = sorted(
-        [s for s in skaters if roster.get(s["player_id"], {}).get("is_fa", True)],
-        key=lambda s: s["points"], reverse=True,
-    )
-    fa_ids = [s["player_id"] for s in fa_sorted[:top_n]]
-    return list(set(my_ids + fa_ids))
+# 4. Per-game stats — incremental: fetch only games since last stored date
+def _game_log_date_range() -> tuple[str, str]:
+    """
+    Returns (since_date, until_date) for the next incremental fetch.
+    since_date = day after the latest stored game, or SEASON_START for first run.
+    until_date = today.
+    """
+    latest = latest_game_log_date()
+    if latest:
+        from datetime import datetime, timedelta
+        since = (datetime.fromisoformat(latest) + timedelta(days=1)).date().isoformat()
+    else:
+        since = SEASON_START
+    until = date.today().isoformat()
+    return since, until
+
+
+def _do_game_log_fetch():
+    since, until = _game_log_date_range()
+    if since > until:
+        st.toast("Game logs already up to date.")
+        return
+    with st.spinner(f"Fetching per-game stats {since} → {until}…"):
+        rows = fetch_per_game_stats(since, until)
+        if rows:
+            save_game_logs(rows)
+    st.toast(f"Game logs updated: {len(rows)} player-game rows ({since} → {until}).")
 
 
 if refresh_logs:
-    skater_list = load_skaters()
-    roster      = load_roster_membership()
-    pids        = _priority_player_ids(skater_list, roster, top_n=50)
-    with st.spinner(f"Fetching game logs for {len(pids)} players…"):
-        logs = fetch_game_logs(pids, cfg["season_id"])
-        save_game_logs(logs)
-    st.toast(f"Game logs refreshed for {len(pids)} players.")
+    _do_game_log_fetch()
 
-# Auto-refresh game logs if stale (only for priority players)
-skater_list = load_skaters()
-roster_mem  = load_roster_membership()
-if skater_list and roster_mem:
-    pids = _priority_player_ids(skater_list, roster_mem, top_n=50)
-    if game_logs_stale(pids[:5], ttl_hours=cfg["cache_ttl_hours"]):
-        with st.spinner("Auto-refreshing game logs…"):
-            logs = fetch_game_logs(pids, cfg["season_id"])
-            save_game_logs(logs)
+# Auto-refresh if stale
+if game_logs_need_update(ttl_hours=cfg["cache_ttl_hours"]):
+    _do_game_log_fetch()
 
 # ── Load all data ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=cfg["cache_ttl_hours"] * 3600, show_spinner=False)
 def build_df(weights_tuple, today_str, recent_days):
+    from datetime import timedelta, datetime as _dt
     weights    = dict(weights_tuple)
     skaters    = load_skaters()
     schedule   = load_schedule()
     roster     = load_roster_membership()
-    game_logs  = load_game_logs()
+    # Only load game logs within the recent form window (+ buffer) to keep memory lean
+    since      = (_dt.fromisoformat(today_str) - timedelta(days=recent_days + 2)).date().isoformat()
+    game_logs  = load_game_logs(since_date=since)
 
     if not skaters:
         return None, "No player data. Click '📊 Stats' to fetch from NHL API."
@@ -255,6 +262,6 @@ st.dataframe(
 
 st.caption(
     "**Z-Score** = season total. **Z (Recent)** = last "
-    f"{recent_days} days (G, A, PP, S, PIM only — HIT/BLK/FOW from season rate).  \n"
+    f"{recent_days} days, all 8 categories (G, A, PP, S, PIM, HIT, BLK, FOW per game).  \n"
     "**Missed** = consecutive team games not played (≥3 triggers injury flag)."
 )

@@ -1,15 +1,19 @@
 """
-nhl_api.py — Fetch and merge three NHL Stats API endpoints on playerId,
-plus per-player game logs for recent form and injury detection.
+nhl_api.py — Fetch and merge NHL Stats API data.
 
-Season stats endpoints (api.nhle.com/stats/rest/en/skater/...):
-  summary     → G, A, points, GP, PP (ppPoints), S (shots)
-  realtime    → HIT, BLK, PIM
-  faceoffwins → FOW (totalFaceoffWins)
+Season aggregates (3 endpoints merged on playerId):
+  skater/summary      → G, A, points, GP, PP (ppPoints), S (shots)
+  skater/realtime     → HIT, BLK, PIM
+  skater/faceoffwins  → FOW (totalFaceoffWins)
 
-Game log endpoint (api-web.nhle.com/v1/player/{id}/game-log/{season}/{type}):
-  → per-game G, A, PP, S, PIM  (HIT/BLK/FOW not available at per-game level)
-  → used for: recent form Z-scores, consecutive missed games (injury proxy)
+Per-game data (2 endpoints, isGame=true, merged on gameId+playerId):
+  skater/summary  → G, A, PIM, PP, S per game
+  skater/realtime → HIT, BLK per game
+  FOW is NOT available per game from these endpoints (season rate used instead)
+
+Date-range filtering via cayenneExp: gameDate>="YYYY-MM-DD" and gameDate<="YYYY-MM-DD 23:59:59"
+Designed for incremental ingestion: call fetch_per_game_stats(since, until) with
+only the date range that isn't yet in the DB.
 """
 import requests
 import time
@@ -19,21 +23,21 @@ STATS_BASE = "https://api.nhle.com/stats/rest/en/skater"
 WEB_BASE   = "https://api-web.nhle.com/v1"
 PAGE_SIZE  = 100
 
-# ── Season aggregates ─────────────────────────────────────────────────────────
+SEASON_START = "2025-10-01"   # first day of 2025-26 regular season
 
-def _fetch_endpoint(endpoint: str, season_id: int, sort_field: str) -> list[dict]:
-    rows: list[dict] = []
+
+# ── Shared paginator ──────────────────────────────────────────────────────────
+
+def _paginate(endpoint: str, extra_params: dict) -> list[dict]:
+    """Paginate through a stats REST endpoint, returning all rows."""
+    rows:    list[dict] = []
     start   = 0
     session = requests.Session()
+
     while True:
-        params = {
-            "limit":      PAGE_SIZE,
-            "start":      start,
-            "sort":       sort_field,
-            "cayenneExp": f"seasonId={season_id} and gameTypeId=2",
-        }
+        params = {"limit": PAGE_SIZE, "start": start, **extra_params}
         try:
-            r = session.get(f"{STATS_BASE}/{endpoint}", params=params, timeout=15)
+            r = session.get(f"{STATS_BASE}/{endpoint}", params=params, timeout=20)
             r.raise_for_status()
             payload = r.json()
         except Exception as exc:
@@ -47,21 +51,25 @@ def _fetch_endpoint(endpoint: str, season_id: int, sort_field: str) -> list[dict
         if start >= total:
             break
         time.sleep(0.1)
+
     return rows
 
 
+# ── Season aggregate stats ────────────────────────────────────────────────────
+
 def fetch_skaters(season_id: int) -> list[dict]:
     """
-    Fetch and merge all three stat endpoints.
-    Returns list of dicts with all 8 fantasy categories + metadata.
-    Skips goalies.
+    Fetch season totals from 3 endpoints, merge on playerId.
+    Skips goalies. Returns list of dicts with all 8 fantasy categories.
     """
+    season_exp = f"seasonId={season_id} and gameTypeId=2"
+
     print("  Fetching summary…")
-    summary  = _fetch_endpoint("summary",     season_id, "points")
+    summary  = _paginate("summary",     {"sort": "points",             "cayenneExp": season_exp})
     print("  Fetching realtime…")
-    realtime = _fetch_endpoint("realtime",    season_id, "hits")
+    realtime = _paginate("realtime",    {"sort": "hits",               "cayenneExp": season_exp})
     print("  Fetching faceoffwins…")
-    faceoffs = _fetch_endpoint("faceoffwins", season_id, "totalFaceoffWins")
+    faceoffs = _paginate("faceoffwins", {"sort": "totalFaceoffWins",   "cayenneExp": season_exp})
 
     rt_idx = {r["playerId"]: r for r in realtime}
     fo_idx = {r["playerId"]: r for r in faceoffs}
@@ -72,107 +80,121 @@ def fetch_skaters(season_id: int) -> list[dict]:
         pos = s.get("positionCode", "")
         if pos == "G":
             continue
-
         rt = rt_idx.get(pid, {})
         fo = fo_idx.get(pid, {})
-
         merged.append({
             "player_id": pid,
             "name":      s.get("skaterFullName", "Unknown"),
             "team":      s.get("teamAbbrevs", ""),
             "position":  pos,
             "gp":        int(s.get("gamesPlayed", 0) or 0),
-            "G":         float(s.get("goals",           0) or 0),
-            "A":         float(s.get("assists",         0) or 0),
-            "PP":        float(s.get("ppPoints",        0) or 0),
-            "S":         float(s.get("shots",           0) or 0),
-            "HIT":       float(rt.get("hits",           0) or 0),
-            "BLK":       float(rt.get("blockedShots",   0) or 0),
-            "PIM":       float(rt.get("penaltyMinutes", 0) or 0),
+            "G":         float(s.get("goals",             0) or 0),
+            "A":         float(s.get("assists",           0) or 0),
+            "PP":        float(s.get("ppPoints",          0) or 0),
+            "S":         float(s.get("shots",             0) or 0),
+            "HIT":       float(rt.get("hits",             0) or 0),
+            "BLK":       float(rt.get("blockedShots",     0) or 0),
+            "PIM":       float(rt.get("penaltyMinutes",   0) or 0),
             "FOW":       float(fo.get("totalFaceoffWins", 0) or 0),
-            "points":    float(s.get("points",          0) or 0),
+            "points":    float(s.get("points",            0) or 0),
         })
 
     print(f"  Merged {len(merged)} skaters.")
     return merged
 
 
-# ── Per-game logs ─────────────────────────────────────────────────────────────
+# ── Per-game stats (for recent form + injury detection) ───────────────────────
 
-# Note: the NHL web API game log only provides G, A, PIM, PP (powerPlayPoints),
-# and S (shots). HIT, BLK, and FOW are NOT available at per-game granularity.
-GAMELOG_CATS = ["G", "A", "PP", "S", "PIM"]
-
-def _fetch_one_game_log(player_id: int, season_id: int) -> list[dict]:
-    """Fetch regular-season game log for one player. Returns list of game dicts."""
-    url = f"{WEB_BASE}/player/{player_id}/game-log/{season_id}/2"
-    try:
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        raw = r.json().get("gameLog", [])
-        return [
-            {
-                "game_date": g.get("gameDate", ""),
-                "G":   float(g.get("goals",             0) or 0),
-                "A":   float(g.get("assists",           0) or 0),
-                "PP":  float(g.get("powerPlayPoints",   0) or 0),
-                "S":   float(g.get("shots",             0) or 0),
-                "PIM": float(g.get("pim",               0) or 0),
-            }
-            for g in raw
-        ]
-    except Exception as exc:
-        print(f"  [nhl_api] game log {player_id}: {exc}")
-        return []
-
-
-def fetch_game_logs(player_ids: list[int], season_id: int) -> dict[int, list[dict]]:
+def fetch_per_game_stats(since_date: str, until_date: str) -> list[dict]:
     """
-    Fetch game logs for a list of player_ids.
-    Returns {player_id: [game_dicts]}.
+    Fetch per-game stats for ALL skaters between since_date and until_date (inclusive).
+    Merges summary (G, A, PIM, PP, S) with realtime (HIT, BLK) on gameId+playerId.
+    FOW is not available per-game; callers should use season per-game rate.
+
+    Returns [{player_id, game_id, game_date, G, A, PIM, PP, S, HIT, BLK}]
     """
-    result: dict[int, list[dict]] = {}
-    for i, pid in enumerate(player_ids):
-        result[pid] = _fetch_one_game_log(pid, season_id)
-        if (i + 1) % 10 == 0:
-            print(f"  [nhl_api] game logs: {i+1}/{len(player_ids)}")
-        time.sleep(0.15)
-    return result
+    date_exp  = (f'gameDate>="{since_date}" and '
+                 f'gameDate<="{until_date} 23:59:59" and gameTypeId=2')
+    game_params = {
+        "isAggregate": "false",
+        "isGame":      "true",
+        "cayenneExp":  date_exp,
+        "factCayenneExp": "gamesPlayed>=1",
+    }
+
+    print(f"  Fetching per-game summary {since_date} → {until_date}…")
+    summary_rows = _paginate("summary",     {**game_params, "sort": "points"})
+
+    print(f"  Fetching per-game realtime {since_date} → {until_date}…")
+    rt_rows      = _paginate("realtime",    {**game_params, "sort": "hits"})
+
+    print(f"  Fetching per-game faceoffwins {since_date} → {until_date}…")
+    fo_rows      = _paginate("faceoffwins", {**game_params, "sort": "totalFaceoffWins"})
+
+    # Index realtime and faceoffwins by (gameId, playerId)
+    rt_idx = {(r.get("gameId"), r["playerId"]): r for r in rt_rows}
+    fo_idx = {(r.get("gameId"), r["playerId"]): r for r in fo_rows}
+
+    merged = []
+    seen   = set()
+    for s in summary_rows:
+        pid = s.get("playerId")
+        gid = s.get("gameId")
+        pos = s.get("positionCode", "")
+        if pos == "G" or not pid or not gid:
+            continue
+        key = (gid, pid)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rt = rt_idx.get(key, {})
+        fo = fo_idx.get(key, {})
+        merged.append({
+            "player_id": pid,
+            "game_id":   gid,
+            "game_date": s.get("gameDate", "")[:10],   # "YYYY-MM-DD"
+            "G":         float(s.get("goals",              0) or 0),
+            "A":         float(s.get("assists",            0) or 0),
+            "PP":        float(s.get("ppPoints",           0) or 0),
+            "S":         float(s.get("shots",              0) or 0),
+            "PIM":       float(s.get("penaltyMinutes",     0) or 0),
+            "HIT":       float(rt.get("hits",              0) or 0),
+            "BLK":       float(rt.get("blockedShots",      0) or 0),
+            "FOW":       float(fo.get("totalFaceoffWins",  0) or 0),
+        })
+
+    print(f"  Got {len(merged)} player-game rows.")
+    return merged
 
 
 # ── Injury detection from game log ────────────────────────────────────────────
 
 def detect_missed_games(
-    game_log: list[dict],
-    schedule_dates: list[str],   # all dates the player's TEAM played
+    game_log:       list[dict],    # [{game_date, ...}] from cache
+    schedule_dates: list[str],     # all dates the player's team played
 ) -> dict:
     """
-    Compare player's game log dates against their team's schedule dates.
-    Returns:
-      {
-        consecutive_missed: int,   # most recent streak of missed games
-        missed_last_14d: int,      # games missed in last 14 calendar days
-        injury_flag: bool,         # True if consecutive_missed >= 3
-      }
+    Compare played dates against team schedule to detect probable injuries.
+    Returns {consecutive_missed, missed_last_14d, injury_flag}.
     """
     if not schedule_dates:
         return {"consecutive_missed": 0, "missed_last_14d": 0, "injury_flag": False}
 
-    played_dates = {g["game_date"] for g in game_log if g["game_date"]}
-    sorted_sched = sorted(schedule_dates)
+    played = {g["game_date"] for g in game_log}
+    sched  = sorted(schedule_dates)
 
-    # Consecutive missed (working backwards from last scheduled game)
+    # Consecutive missed games from the most recent scheduled game backwards
     consecutive = 0
-    for d in reversed(sorted_sched):
-        if d not in played_dates:
+    for d in reversed(sched):
+        if d not in played:
             consecutive += 1
         else:
             break
 
-    # Missed in last 14 calendar days
-    cutoff = (date.today() - timedelta(days=14)).isoformat()
-    recent_sched  = [d for d in sorted_sched if d >= cutoff]
-    missed_recent = sum(1 for d in recent_sched if d not in played_dates)
+    cutoff        = (date.today() - timedelta(days=14)).isoformat()
+    recent_sched  = [d for d in sched if d >= cutoff]
+    missed_recent = sum(1 for d in recent_sched if d not in played)
 
     return {
         "consecutive_missed": consecutive,
