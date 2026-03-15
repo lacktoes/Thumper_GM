@@ -1,6 +1,14 @@
 """
-app.py — Thumpers GM Dashboard
-Streamlit entry point. Handles data loading, caching, and sidebar.
+app.py — Thumpers GM Dashboard (home page + data orchestration).
+
+Data flow:
+  1. NHL Stats API  → season skater stats (8 cats, all skaters)
+  2. Yahoo Fantasy  → roster membership + injury status (who is rostered/FA)
+  3. NHL Web API    → game logs for top players (recent form + injury detection)
+  4. NHL Web API    → full season schedule (used for density + injury gap detection)
+
+Credentials (set in .streamlit/secrets.toml for deployment, or .env locally):
+  YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET, YAHOO_REFRESH_TOKEN, YAHOO_LEAGUE_KEY
 """
 import sys
 from pathlib import Path
@@ -12,14 +20,17 @@ import streamlit as st
 import yaml
 from datetime import date
 
-from src.cache          import (init_players_db, init_schedule_db,
-                                 save_skaters, load_skaters, skaters_stale,
-                                 save_schedule, load_schedule, schedule_stale,
-                                 save_roster_membership, load_roster_membership)
-from src.nhl_api        import fetch_skaters
-from src.schedule       import fetch_schedule
-from src.fantasy_roster import load_roster
-from src.analytics      import build_player_df
+from src.cache        import (
+    init_players_db, init_schedule_db,
+    save_skaters,    load_skaters,    skaters_stale,
+    save_schedule,   load_schedule,   schedule_stale,
+    save_roster_membership, load_roster_membership, roster_stale,
+    save_game_logs,  load_game_logs,  game_logs_stale,
+)
+from src.nhl_api      import fetch_skaters, fetch_game_logs
+from src.schedule     import fetch_schedule
+from src.yahoo_fantasy import fetch_all_rosters, build_roster_membership
+from src.analytics    import build_player_df
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -27,6 +38,8 @@ from src.analytics      import build_player_df
 def load_config():
     with open(ROOT / "config.yaml") as f:
         return yaml.safe_load(f)
+
+cfg = load_config()
 
 # ── Page setup ────────────────────────────────────────────────────────────────
 
@@ -37,7 +50,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-cfg = load_config()
+# ── DB init ───────────────────────────────────────────────────────────────────
+
+init_players_db()
+init_schedule_db()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
@@ -47,11 +63,10 @@ with st.sidebar:
     st.divider()
 
     st.subheader("Category Weights")
-    st.caption("Set to 0 to punt a category.")
+    st.caption("Set to 0.0 to punt a category.")
     weights = {}
     for cat in cfg["categories"]:
-        default = cfg["weights"].get(cat, 1.0)
-        weights[cat] = st.slider(cat, 0.0, 1.0, default, 0.1, key=f"w_{cat}")
+        weights[cat] = st.slider(cat, 0.0, 1.0, float(cfg["weights"].get(cat, 1.0)), 0.1, key=f"w_{cat}")
 
     st.divider()
 
@@ -60,122 +75,186 @@ with st.sidebar:
         min_value=0.0, max_value=5.0,
         value=float(cfg["drop_threshold"]),
         step=0.1,
-        help="Min value score gap (FA - Rostered) to flag a drop",
     )
-
+    recent_days = st.slider(
+        "Recent Form Window (days)", 7, 60,
+        int(cfg.get("recent_form_days", 14)),
+        help="Calculate form Z-score from games in this window",
+    )
     today_input = st.date_input("Schedule start date", value=date.today())
     today_str   = today_input.isoformat()
 
     st.divider()
-    refresh_players  = st.button("🔄 Refresh Player Stats")
-    refresh_schedule = st.button("🔄 Refresh Schedule")
-    refresh_roster   = st.button("🔄 Sync Roster")
+    col_a, col_b = st.columns(2)
+    refresh_stats    = col_a.button("📊 Stats",    help="Refresh NHL player stats")
+    refresh_schedule = col_b.button("📅 Schedule", help="Refresh NHL schedule")
+    col_c, col_d = st.columns(2)
+    refresh_roster   = col_c.button("👥 Roster",   help="Sync Yahoo Fantasy rosters + injury status")
+    refresh_logs     = col_d.button("📈 Form",     help="Refresh game logs for top players")
 
-# ── DB init ───────────────────────────────────────────────────────────────────
+# ── Data refresh ──────────────────────────────────────────────────────────────
 
-init_players_db()
-init_schedule_db()
+yahoo_ok = True
 
-# ── Data loading ──────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=cfg["cache_ttl_hours"] * 3600, show_spinner=False)
-def get_skaters(season_id: int) -> list[dict]:
-    return load_skaters()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_schedule() -> list[dict]:
-    return load_schedule()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_roster_membership() -> dict:
-    return load_roster_membership()
-
-
-# ── Refresh triggers ──────────────────────────────────────────────────────────
-
-if refresh_players or skaters_stale(cfg["cache_ttl_hours"]):
-    with st.spinner("Fetching NHL player stats from api.nhle.com…"):
+# 1. Season stats (NHL API)
+if refresh_stats or skaters_stale(cfg["cache_ttl_hours"]):
+    with st.spinner("Fetching NHL skater stats…"):
         skaters = fetch_skaters(cfg["season_id"])
         save_skaters(skaters)
-    get_skaters.clear()
-    st.success(f"Loaded {len(skaters)} skaters.")
+    st.toast(f"Loaded {len(skaters)} skaters.")
 
+# 2. Schedule (NHL API)
 if refresh_schedule or schedule_stale(7):
-    with st.spinner("Scraping schedule from hockey-reference.com…"):
+    with st.spinner("Fetching NHL schedule from api-web.nhle.com…"):
         sched = fetch_schedule()
         if sched:
             save_schedule(sched)
-    get_schedule.clear()
-    if sched:
-        st.success(f"Loaded {len(sched)} games.")
-    else:
-        st.warning("Could not scrape schedule — check your internet connection.")
+            st.toast(f"Loaded {len(sched)} games.")
+        else:
+            st.warning("Schedule fetch returned no games.")
 
-if refresh_roster:
-    skaters = get_skaters(cfg["season_id"])
-    roster = load_roster(skaters)
-    save_roster_membership([
-        {"player_id": pid, **info}
-        for pid, info in roster.items()
-    ])
-    get_roster_membership.clear()
-    st.success("Roster synced.")
+# 3. Roster + injury status (Yahoo Fantasy API)
+if refresh_roster or roster_stale(cfg["cache_ttl_hours"]):
+    league_key  = None
+    try:
+        import os
+        try:
+            league_key = st.secrets.get("YAHOO_LEAGUE_KEY") or os.environ.get("YAHOO_LEAGUE_KEY")
+        except Exception:
+            league_key = os.environ.get("YAHOO_LEAGUE_KEY")
+
+        if not league_key:
+            st.warning("YAHOO_LEAGUE_KEY not set — roster/injury data unavailable. "
+                       "Add it to .streamlit/secrets.toml.")
+            yahoo_ok = False
+        else:
+            with st.spinner("Syncing Yahoo Fantasy rosters + injury status…"):
+                skater_list  = load_skaters()
+                yahoo_roster = fetch_all_rosters(league_key, cfg["total_teams"])
+                merged       = build_roster_membership(yahoo_roster, [s["player_id"] for s in skater_list])
+                save_roster_membership([
+                    {"player_id": pid, **info}
+                    for pid, info in merged.items()
+                ])
+            st.toast(f"Roster synced — {len([v for v in merged.values() if not v['is_fa']])} rostered players.")
+    except Exception as exc:
+        st.warning(f"Yahoo roster sync failed: {exc}")
+        yahoo_ok = False
+
+# 4. Game logs (NHL Web API) — for priority players
+def _priority_player_ids(skaters: list, roster: dict, top_n: int = 40) -> list[int]:
+    """My roster + top N FAs by season points."""
+    my_team   = cfg["my_team_number"]
+    my_ids    = [s["player_id"] for s in skaters
+                 if roster.get(s["player_id"], {}).get("team_number") == my_team]
+    fa_sorted = sorted(
+        [s for s in skaters if roster.get(s["player_id"], {}).get("is_fa", True)],
+        key=lambda s: s["points"], reverse=True,
+    )
+    fa_ids = [s["player_id"] for s in fa_sorted[:top_n]]
+    return list(set(my_ids + fa_ids))
 
 
-# ── Build master DataFrame ────────────────────────────────────────────────────
+if refresh_logs:
+    skater_list = load_skaters()
+    roster      = load_roster_membership()
+    pids        = _priority_player_ids(skater_list, roster, top_n=50)
+    with st.spinner(f"Fetching game logs for {len(pids)} players…"):
+        logs = fetch_game_logs(pids, cfg["season_id"])
+        save_game_logs(logs)
+    st.toast(f"Game logs refreshed for {len(pids)} players.")
+
+# Auto-refresh game logs if stale (only for priority players)
+skater_list = load_skaters()
+roster_mem  = load_roster_membership()
+if skater_list and roster_mem:
+    pids = _priority_player_ids(skater_list, roster_mem, top_n=50)
+    if game_logs_stale(pids[:5], ttl_hours=cfg["cache_ttl_hours"]):
+        with st.spinner("Auto-refreshing game logs…"):
+            logs = fetch_game_logs(pids, cfg["season_id"])
+            save_game_logs(logs)
+
+# ── Load all data ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=cfg["cache_ttl_hours"] * 3600, show_spinner=False)
-def build_df(weights_tuple, today_str):
-    weights = dict(weights_tuple)
-    skaters  = load_skaters()
-    schedule = load_schedule()
-    roster   = load_roster_membership()
+def build_df(weights_tuple, today_str, recent_days):
+    weights    = dict(weights_tuple)
+    skaters    = load_skaters()
+    schedule   = load_schedule()
+    roster     = load_roster_membership()
+    game_logs  = load_game_logs()
 
     if not skaters:
-        return None, "No player data. Click 'Refresh Player Stats'."
+        return None, "No player data. Click '📊 Stats' to fetch from NHL API."
 
-    if not roster:
-        from src.fantasy_roster import load_roster as _lr
-        roster = _lr(skaters)
-
-    df = build_player_df(skaters, roster, schedule, weights, cfg, today=today_str)
+    df = build_player_df(
+        skaters, roster, schedule, game_logs, weights, cfg,
+        today=today_str,
+    )
     return df, None
 
 
 with st.spinner("Building player data…"):
-    df, err = build_df(tuple(sorted(weights.items())), today_str)
+    df, err = build_df(tuple(sorted(weights.items())), today_str, recent_days)
 
 if err:
     st.error(err)
     st.stop()
 
-# Expose to pages via session_state
-st.session_state["df"]              = df
-st.session_state["cfg"]             = cfg
-st.session_state["weights"]         = weights
-st.session_state["drop_threshold"]  = drop_threshold
-st.session_state["today_str"]       = today_str
-st.session_state["schedule"]        = get_schedule()
+# Publish to session_state for page modules
+st.session_state.update({
+    "df":             df,
+    "cfg":            cfg,
+    "weights":        weights,
+    "drop_threshold": drop_threshold,
+    "today_str":      today_str,
+    "recent_days":    recent_days,
+    "schedule":       load_schedule(),
+})
 
 # ── Home page ─────────────────────────────────────────────────────────────────
 
 st.title("🏒 Thumpers GM Dashboard")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Skaters loaded",     len(df))
-col2.metric("Rostered players",   int((~df["is_fa"]).sum()))
-col3.metric("Free agents",        int(df["is_fa"].sum()))
+col1.metric("Skaters loaded",      len(df))
+col2.metric("Rostered",            int((~df["is_fa"]).sum()))
+col3.metric("Free Agents",         int(df["is_fa"].sum()))
 col4.metric("My roster (Thumpers)", int((df["team_number"] == cfg["my_team_number"]).sum()))
 
-st.info("Use the sidebar to adjust category weights, then navigate to a view using the pages menu.")
+# Injury alert banner
+injured = df[
+    (df["team_number"] == cfg["my_team_number"]) &
+    (df["injury_flag"].astype(bool) | df["status"].isin(["IR", "IR-LT", "IL", "O"]))
+]
+if not injured.empty:
+    names = ", ".join(injured["name"].tolist())
+    st.error(f"⚠️  Injury alert on your roster: {names}")
 
-# Quick preview: my roster
+st.divider()
 st.subheader(f"My Roster — {cfg['my_team_name']}")
+
 my = df[df["team_number"] == cfg["my_team_number"]].sort_values("total_z", ascending=False)
-display_cols = ["name", "team", "position", "gp", "G", "A", "PP", "S", "HIT", "BLK", "PIM", "FOW",
-                "total_z", "vorp", "games_7d", "value_7d"]
+display_cols = [
+    "name", "team", "position", "gp",
+    "G", "A", "PP", "S", "HIT", "BLK", "PIM", "FOW",
+    "total_z", "total_z_recent", "vorp", "games_7d", "value_7d",
+    "injury_status", "consecutive_missed",
+]
 st.dataframe(
-    my[[c for c in display_cols if c in my.columns]],
+    my[[c for c in display_cols if c in my.columns]].reset_index(drop=True),
     use_container_width=True,
     hide_index=True,
+    column_config={
+        "injury_status":     st.column_config.TextColumn("Status"),
+        "total_z":           st.column_config.NumberColumn("Z-Score", format="%.3f"),
+        "total_z_recent":    st.column_config.NumberColumn("Z (Recent)", format="%.3f"),
+        "consecutive_missed":st.column_config.NumberColumn("Missed"),
+    },
+)
+
+st.caption(
+    "**Z-Score** = season total. **Z (Recent)** = last "
+    f"{recent_days} days (G, A, PP, S, PIM only — HIT/BLK/FOW from season rate).  \n"
+    "**Missed** = consecutive team games not played (≥3 triggers injury flag)."
 )

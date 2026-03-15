@@ -2,6 +2,5 @@ __pycache__/
 *.py[cod]
 .env
 data/*.db
-data/exports/*.csv
-*.json
+data/exports/
 .streamlit/secrets.toml

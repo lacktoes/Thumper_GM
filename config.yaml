@@ -48,5 +48,8 @@ schedule_windows:
   short: 7
   long:  14
 
+# Recent form Z-score window (days). Sidebar slider overrides at runtime.
+recent_form_days: 14
+
 # Cache TTL in hours
 cache_ttl_hours: 4

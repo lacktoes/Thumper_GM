@@ -1,23 +1,16 @@
 """
 3_Heatmap.py — Roster Heatmap (Gameday View)
 
-Shows Thumpers roster players on a calendar grid for the next 7 days.
-Each cell shows whether the player has a game that night, with a
-Z-score strength overlay (colour intensity).
-
-Rows = players (sorted by value_7d desc)
-Cols = next 7 days
-Cell colour intensity = player's total_z (green=high, grey=no game)
+7-day calendar grid for Thumpers roster.
+Cell colour = Z-score strength. Red border = injured player.
 """
 import streamlit as st
 import pandas as pd
-import numpy as np
 from datetime import date, timedelta
+from collections import defaultdict
 
 st.set_page_config(page_title="Heatmap — Thumpers GM", layout="wide")
 st.title("📅 Roster Heatmap — Gameday View")
-
-# ── Pull shared state ─────────────────────────────────────────────────────────
 
 if "df" not in st.session_state:
     st.warning("Return to the home page to load data first.")
@@ -29,143 +22,123 @@ schedule  = st.session_state["schedule"]
 today_str = st.session_state["today_str"]
 my_team   = cfg["my_team_number"]
 
-# ── Build date range ──────────────────────────────────────────────────────────
-
 today = date.fromisoformat(today_str)
 days  = [today + timedelta(days=i) for i in range(7)]
 day_strs = [d.isoformat() for d in days]
-day_labels = [d.strftime("%a %b %-d") if hasattr(date, 'strftime') else d.strftime("%a %b %d")
-              for d in days]
-
-# Windows: try %-d (Linux), fall back to %d
 try:
     day_labels = [d.strftime("%a %-d %b") for d in days]
 except ValueError:
     day_labels = [d.strftime("%a %d %b") for d in days]
 
-# ── Build game lookup: {team: set of date strings} ────────────────────────────
+# ── Build lookups ─────────────────────────────────────────────────────────────
 
-from collections import defaultdict
 team_game_dates: dict[str, set] = defaultdict(set)
+games_per_day:   dict[str, int] = defaultdict(int)
 for g in schedule:
     if g["game_date"] in day_strs:
         team_game_dates[g["home_team"]].add(g["game_date"])
         team_game_dates[g["away_team"]].add(g["game_date"])
-
-# ── Total NHL games per day (for light night detection) ───────────────────────
-
-games_per_day: dict[str, int] = defaultdict(int)
-for g in schedule:
-    if g["game_date"] in day_strs:
         games_per_day[g["game_date"]] += 1
-
-# ── My roster ────────────────────────────────────────────────────────────────
 
 my = df[df["team_number"] == my_team].sort_values("value_7d", ascending=False)
 
 if my.empty:
-    st.warning("No roster data found. Sync your roster first (sidebar button on home page).")
+    st.warning("No roster data. Sync your Yahoo roster (click '👥 Roster' on the home page).")
     st.stop()
 
 # ── Controls ─────────────────────────────────────────────────────────────────
 
-show_z = st.checkbox("Show Z-score in cells", value=True)
-show_cats = st.checkbox("Show stat breakdown below heatmap", value=False)
+show_z    = st.checkbox("Show Z-score in game cells", value=True)
+use_recent = st.checkbox("Colour by Recent Form Z (instead of season Z)", value=False)
 
-# ── Build heatmap HTML ───────────────────────────────────────────────────────
+# ── Heatmap HTML ─────────────────────────────────────────────────────────────
 
-def z_to_colour(z: float, has_game: bool) -> str:
-    """Map z-score to a background colour string."""
+def z_bg(z: float, has_game: bool, is_injured: bool) -> str:
+    if is_injured and has_game:
+        return "#5a1a1a"   # dark red
+    if is_injured:
+        return "#2e1a1a"
     if not has_game:
-        return "#1e1e2e"  # dark, no game
-    # Clamp z to [-2, 3] then map to green intensity
+        return "#1a1a2e"
     clamped = max(-2.0, min(3.0, z))
-    t = (clamped + 2.0) / 5.0  # 0→1
-    # Interpolate #334 (low z) → #0d4 (high z)
-    r = int(30  + t * 10)
-    g = int(60  + t * 150)
-    b = int(40  + t * 20)
+    t = (clamped + 2.0) / 5.0
+    r = int(20  + t * 15)
+    g = int(55  + t * 160)
+    b = int(35  + t * 20)
     return f"rgb({r},{g},{b})"
 
 
-def z_text_colour(z: float, has_game: bool) -> str:
-    return "#888" if not has_game else "#eee"
-
-
-# Build HTML table
 header_cells = "".join(
-    f'<th style="padding:6px 10px;font-size:11px;color:#aaa;'
-    f'background:{"#2a2040" if games_per_day.get(d, 0) < 5 and games_per_day.get(d, 0) > 0 else "#111"}">'
-    f'{lbl}{"<br>⭐" if games_per_day.get(d, 0) > 0 and games_per_day.get(d, 0) < 5 else ""}</th>'
+    f'<th style="padding:6px 12px;font-size:11px;color:#aaa;'
+    f'background:{"#2a2040" if 0 < games_per_day.get(d, 0) < 5 else "#111"}">'
+    f'{lbl}{"<br>⭐" if 0 < games_per_day.get(d, 0) < 5 else ""}</th>'
     for d, lbl in zip(day_strs, day_labels)
 )
-header = f'<tr><th style="padding:6px 10px;font-size:11px;color:#aaa;text-align:left">Player</th>{header_cells}</tr>'
+header = f'<tr><th style="padding:6px 10px;text-align:left;color:#aaa;font-size:11px">Player</th>{header_cells}</tr>'
 
 rows_html = []
 for _, row in my.iterrows():
-    team = row["team"]
-    z    = row["total_z"]
+    team       = row["team"]
+    z          = float(row["total_z_recent"] if use_recent and "total_z_recent" in row else row["total_z"])
+    is_injured = bool(row.get("injury_flag")) or str(row.get("status", "")) in {"IR", "IR-LT", "IL", "O"}
+    inj_badge  = " ⚠️" if is_injured else ""
+
     name_cell = (
-        f'<td style="white-space:nowrap;padding:5px 10px;font-size:12px;'
-        f'font-weight:600;color:#ddd">'
-        f'{row["name"]} <span style="color:#888;font-weight:400">'
-        f'({row["position"]}) z={z:.2f}</span></td>'
+        f'<td style="white-space:nowrap;padding:5px 10px;font-size:12px;font-weight:600;'
+        f'color:{"#ff6b6b" if is_injured else "#ddd"}">'
+        f'{row["name"]}{inj_badge} '
+        f'<span style="color:#777;font-weight:400">({row["position"]})</span></td>'
     )
+
     day_cells = []
     for d in day_strs:
         has_game = d in team_game_dates.get(team, set())
-        bg  = z_to_colour(z, has_game)
-        fg  = z_text_colour(z, has_game)
+        bg = z_bg(z, has_game, is_injured)
+        light = 0 < games_per_day.get(d, 0) < 5
         label = team if has_game else "—"
-        extra = " ⭐" if has_game and games_per_day.get(d, 99) < 5 else ""
+        star  = " ⭐" if has_game and light else ""
+        z_str = f"<br><small>{z:+.1f}</small>" if show_z and has_game else ""
         day_cells.append(
             f'<td style="text-align:center;padding:5px 8px;background:{bg};'
-            f'color:{fg};font-size:11px;border-radius:4px">'
-            f'{label}{extra}'
-            f'{"<br><small>" + str(round(z,1)) + "</small>" if show_z and has_game else ""}'
-            f'</td>'
+            f'color:#eee;font-size:11px;border-radius:4px">'
+            f'{label}{star}{z_str}</td>'
         )
+
     rows_html.append(f'<tr>{name_cell}{"".join(day_cells)}</tr>')
 
-table_html = (
-    '<table style="border-collapse:separate;border-spacing:2px;width:100%">'
-    f'<thead style="background:#111">{header}</thead>'
+table = (
+    '<table style="border-collapse:separate;border-spacing:3px;width:100%">'
+    f'<thead>{header}</thead>'
     f'<tbody>{"".join(rows_html)}</tbody>'
     '</table>'
 )
+st.markdown(f'<div style="overflow-x:auto">{table}</div>', unsafe_allow_html=True)
 
-st.markdown(
-    f'<div style="overflow-x:auto">{table_html}</div>',
-    unsafe_allow_html=True,
-)
+legend = ("Colour = " + ("recent form " if use_recent else "season ") +
+          "Z-score. 🔴/⚠️ = injured/IR. ⭐ = light night (< 5 NHL games).")
+st.caption(legend)
 
-st.caption("⭐ = Light night (< 5 total NHL games). Colour intensity = Z-score strength.")
+st.divider()
 
-# ── Stat breakdown ────────────────────────────────────────────────────────────
+# ── Active count summary ──────────────────────────────────────────────────────
 
-if show_cats:
-    st.subheader("Stat Breakdown")
-    cat_cols = ["name", "position", "gp"] + cfg["categories"] + ["total_z", "vorp", "games_7d", "value_7d"]
-    st.dataframe(
-        my[[c for c in cat_cols if c in my.columns]].reset_index(drop=True),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# ── Games per day summary ─────────────────────────────────────────────────────
-
-st.subheader("My Players Active Per Day")
-active_counts = {}
-for d in day_strs:
-    active_counts[d] = sum(
-        1 for _, row in my.iterrows()
-        if d in team_game_dates.get(row["team"], set())
-    )
-
+st.subheader("Active Players Per Day")
 summary_df = pd.DataFrame({
     "Date":        day_labels,
-    "My Players":  [active_counts[d] for d in day_strs],
+    "My Active":   [sum(1 for _, r in my.iterrows()
+                        if d in team_game_dates.get(r["team"], set())) for d in day_strs],
     "NHL Games":   [games_per_day.get(d, 0) for d in day_strs],
-    "Light Night": ["⭐" if games_per_day.get(d, 99) < 5 and games_per_day.get(d, 0) > 0 else "" for d in day_strs],
+    "Light Night": ["⭐" if 0 < games_per_day.get(d, 99) < 5 else "" for d in day_strs],
 })
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+# ── Injury detail ─────────────────────────────────────────────────────────────
+
+injured = my[my["injury_flag"].astype(bool) | my["status"].isin(["IR", "IR-LT", "IL", "O"])]
+if not injured.empty:
+    st.divider()
+    st.subheader("⚠️ Injury / Availability Concerns")
+    inj_cols = ["name", "team", "position", "status", "injury_note",
+                "consecutive_missed", "missed_last_14d", "injury_status"]
+    st.dataframe(injured[[c for c in inj_cols if c in injured.columns]].reset_index(drop=True),
+                 use_container_width=True, hide_index=True)

@@ -1,138 +1,107 @@
 """
-schedule.py — Scrape the 2025-26 NHL schedule from hockey-reference.com.
+schedule.py — Fetch the full 2025-26 NHL regular season schedule via the
+official NHL Web API (api-web.nhle.com).  Replaces the hockey-reference
+scraper which was blocked by bot detection.
 
-Produces rows: [{game_date: "YYYY-MM-DD", home_team: "BOS", away_team: "TOR"}, ...]
+Endpoint: GET /v1/club-schedule-season/{abbrev}/{season}
+  -> returns all games for that team (pre-season, regular, playoffs)
+  -> filtered to gameType==2 (regular season)
+  -> deduplicated by game ID across all 32 teams
 
-Team name normalisation maps hockey-reference full names to 3-letter NHL codes
-so they match the team abbreviations returned by the NHL Stats API.
+Each stored game: {game_date: "YYYY-MM-DD", home_team: "BOS", away_team: "TOR"}
 """
-import re
 import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
+import time
+from datetime import date, timedelta
+from collections import Counter
 
-URL = "https://www.hockey-reference.com/leagues/NHL_2026_games.html"
+BASE  = "https://api-web.nhle.com/v1"
+SEASON = "20252026"
 
-# Map hockey-reference visitor/home names to NHL API abbreviations
-TEAM_MAP = {
-    "Anaheim Ducks":           "ANA",
-    "Arizona Coyotes":         "ARI",
-    "Utah Hockey Club":        "UTA",
-    "Boston Bruins":           "BOS",
-    "Buffalo Sabres":          "BUF",
-    "Calgary Flames":          "CGY",
-    "Carolina Hurricanes":     "CAR",
-    "Chicago Blackhawks":      "CHI",
-    "Colorado Avalanche":      "COL",
-    "Columbus Blue Jackets":   "CBJ",
-    "Dallas Stars":            "DAL",
-    "Detroit Red Wings":       "DET",
-    "Edmonton Oilers":         "EDM",
-    "Florida Panthers":        "FLA",
-    "Los Angeles Kings":       "LAK",
-    "Minnesota Wild":          "MIN",
-    "Montreal Canadiens":      "MTL",
-    "Nashville Predators":     "NSH",
-    "New Jersey Devils":       "NJD",
-    "New York Islanders":      "NYI",
-    "New York Rangers":        "NYR",
-    "Ottawa Senators":         "OTT",
-    "Philadelphia Flyers":     "PHI",
-    "Pittsburgh Penguins":     "PIT",
-    "San Jose Sharks":         "SJS",
-    "Seattle Kraken":          "SEA",
-    "St. Louis Blues":         "STL",
-    "Tampa Bay Lightning":     "TBL",
-    "Toronto Maple Leafs":     "TOR",
-    "Vancouver Canucks":       "VAN",
-    "Vegas Golden Knights":    "VGK",
-    "Washington Capitals":     "WSH",
-    "Winnipeg Jets":           "WPG",
-}
-
-
-def _norm(name: str) -> str:
-    return TEAM_MAP.get(name.strip(), name.strip()[:3].upper())
+NHL_TEAMS = [
+    "ANA", "BOS", "BUF", "CAR", "CBJ", "CGY", "CHI", "COL",
+    "DAL", "DET", "EDM", "FLA", "LAK", "MIN", "MTL", "NJD",
+    "NSH", "NYI", "NYR", "OTT", "PHI", "PIT", "SEA", "SJS",
+    "STL", "TBL", "TOR", "UTA", "VAN", "VGK", "WSH", "WPG",
+]
 
 
 def fetch_schedule() -> list[dict]:
-    """Scrape and return all 2025-26 regular season games."""
-    headers = {"User-Agent": "Mozilla/5.0 (thumpers-gm-dashboard/1.0)"}
-    try:
-        r = requests.get(URL, headers=headers, timeout=20)
-        r.raise_for_status()
-    except Exception as exc:
-        print(f"  [schedule] fetch error: {exc}")
-        return []
+    """
+    Fetch schedules for all 32 NHL teams and merge into a deduplicated game list.
+    Returns [{game_date, home_team, away_team}, ...]
+    """
+    session = requests.Session()
+    seen_ids: set[int] = set()
+    rows: list[dict] = []
 
-    soup = BeautifulSoup(r.text, "lxml")
-    table = soup.find("table", {"id": "games"})
-    if not table:
-        print("  [schedule] could not find #games table")
-        return []
-
-    rows = []
-    for tr in table.find("tbody").find_all("tr"):
-        if tr.get("class") and "thead" in tr.get("class", []):
-            continue
-        cols = tr.find_all(["td", "th"])
-        if len(cols) < 5:
-            continue
+    for abbrev in NHL_TEAMS:
+        url = f"{BASE}/club-schedule-season/{abbrev}/{SEASON}"
         try:
-            # Column order: Date, Visitor, Goals, Home, Goals, [OT], Attendance, ...
-            raw_date  = cols[0].get_text(strip=True)
-            visitor   = cols[1].get_text(strip=True)
-            home      = cols[3].get_text(strip=True)
-
-            # hockey-reference uses "Mon, Oct 14, 2025" format
-            date_str = datetime.strptime(raw_date, "%a, %b %d, %Y").strftime("%Y-%m-%d")
-
-            if visitor and home:
-                rows.append({
-                    "game_date": date_str,
-                    "home_team": _norm(home),
-                    "away_team": _norm(visitor),
-                })
-        except Exception:
+            r = session.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            print(f"  [schedule] {abbrev} error: {exc}")
+            time.sleep(0.5)
             continue
 
-    print(f"  [schedule] scraped {len(rows)} games.")
+        for game in data.get("games", []):
+            if game.get("gameType") != 2:   # regular season only
+                continue
+            gid = game.get("id")
+            if gid in seen_ids:
+                continue
+            seen_ids.add(gid)
+
+            rows.append({
+                "game_id":   gid,
+                "game_date": game["gameDate"],                          # "YYYY-MM-DD"
+                "home_team": game["homeTeam"]["abbrev"],
+                "away_team": game["awayTeam"]["abbrev"],
+            })
+
+        time.sleep(0.1)
+
+    rows.sort(key=lambda g: g["game_date"])
+    print(f"  [schedule] fetched {len(rows)} regular season games across 32 teams.")
     return rows
 
 
+# ── Query helpers ─────────────────────────────────────────────────────────────
+
 def games_in_window(schedule: list[dict], team: str, start_date: str, days: int) -> int:
-    """Count how many games `team` plays from start_date over the next `days` days."""
-    from datetime import date, timedelta
+    """Count games for `team` from start_date over the next `days` days."""
     d0 = date.fromisoformat(start_date)
     d1 = d0 + timedelta(days=days)
-    count = 0
-    for g in schedule:
-        gd = date.fromisoformat(g["game_date"])
-        if d0 <= gd < d1 and (g["home_team"] == team or g["away_team"] == team):
-            count += 1
-    return count
+    return sum(
+        1 for g in schedule
+        if d0 <= date.fromisoformat(g["game_date"]) < d1
+        and (g["home_team"] == team or g["away_team"] == team)
+    )
 
 
 def game_dates_in_window(schedule: list[dict], team: str, start_date: str, days: int) -> list[str]:
-    """Return sorted list of game dates for `team` in the next `days` days."""
-    from datetime import date, timedelta
+    """Return sorted game dates for `team` in the next `days` days."""
     d0 = date.fromisoformat(start_date)
     d1 = d0 + timedelta(days=days)
-    dates = []
-    for g in schedule:
-        gd = date.fromisoformat(g["game_date"])
-        if d0 <= gd < d1 and (g["home_team"] == team or g["away_team"] == team):
-            dates.append(g["game_date"])
-    return sorted(set(dates))
+    return sorted({
+        g["game_date"] for g in schedule
+        if d0 <= date.fromisoformat(g["game_date"]) < d1
+        and (g["home_team"] == team or g["away_team"] == team)
+    })
+
+
+def team_games_in_window(schedule: list[dict], team: str, start_date: str, days: int) -> list[str]:
+    """Same as game_dates_in_window — explicit alias for injury detection."""
+    return game_dates_in_window(schedule, team, start_date, days)
 
 
 def light_nights(schedule: list[dict], start_date: str, days: int, threshold: int = 5) -> set[str]:
     """
-    Return set of dates within the window that have fewer than `threshold`
-    total NHL games — i.e. "light nights" where streaming is advantageous.
+    Dates within window with fewer than `threshold` total NHL games
+    (i.e. light nights where streaming is advantageous).
     """
-    from datetime import date, timedelta
-    from collections import Counter
     d0 = date.fromisoformat(start_date)
     d1 = d0 + timedelta(days=days)
     counts: Counter = Counter()
@@ -140,4 +109,4 @@ def light_nights(schedule: list[dict], start_date: str, days: int, threshold: in
         gd = date.fromisoformat(g["game_date"])
         if d0 <= gd < d1:
             counts[g["game_date"]] += 1
-    return {d for d, cnt in counts.items() if cnt < threshold}
+    return {d for d, cnt in counts.items() if 0 < cnt < threshold}
