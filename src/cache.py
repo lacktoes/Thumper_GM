@@ -28,9 +28,17 @@ def _sched_conn():
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
+def _migrate_table(con, table: str, required_cols: set[str], create_sql: str):
+    """Drop and recreate a table if any required columns are missing."""
+    existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    if existing and not required_cols.issubset(existing):
+        con.execute(f"DROP TABLE {table}")
+    con.execute(create_sql)
+
+
 def init_players_db():
     with _players_conn() as con:
-        con.execute("""
+        _migrate_table(con, "skater_stats", {"G", "A", "FOW", "HIT", "BLK"}, """
             CREATE TABLE IF NOT EXISTS skater_stats (
                 player_id   INTEGER PRIMARY KEY,
                 name        TEXT, team TEXT, position TEXT, gp INTEGER,
@@ -39,7 +47,7 @@ def init_players_db():
                 points REAL, fetched_at TEXT
             )
         """)
-        con.execute("""
+        _migrate_table(con, "roster_membership", {"status", "injury_note"}, """
             CREATE TABLE IF NOT EXISTS roster_membership (
                 player_id   INTEGER PRIMARY KEY,
                 team_number INTEGER,
@@ -50,7 +58,7 @@ def init_players_db():
                 fetched_at  TEXT
             )
         """)
-        con.execute("""
+        _migrate_table(con, "game_logs", {"game_id", "HIT", "BLK", "FOW"}, """
             CREATE TABLE IF NOT EXISTS game_logs (
                 player_id  INTEGER,
                 game_id    INTEGER,
@@ -65,6 +73,10 @@ def init_players_db():
 
 def init_schedule_db():
     with _sched_conn() as con:
+        # Check if game_id column exists; if not, drop and recreate (it's just a cache)
+        cols = {row[1] for row in con.execute("PRAGMA table_info(games)").fetchall()}
+        if cols and "game_id" not in cols:
+            con.execute("DROP TABLE games")
         con.execute("""
             CREATE TABLE IF NOT EXISTS games (
                 game_id    INTEGER PRIMARY KEY,
