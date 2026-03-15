@@ -1,0 +1,17 @@
+# name_overrides.yaml
+# Maps: NHL API player name  →  Yahoo Fantasy player name
+# Only needed for cases NOT handled by:
+#   - Accent stripping (NFKD): Stützle, Čermák, Lafrenière, Kubálik, etc.
+#   - Nickname expansion: Mike/Michael, Matt/Matthew, Jon/Jonathan, Alex/Alexander,
+#                         Tony/Anthony, Cam/Cameron, Will/William, etc.
+#
+# Add entries here when a player still shows as FA despite being rostered.
+# Format: "NHL API Name": "Yahoo Fantasy Name"
+
+# Genuine spelling differences
+"Matthew Barzal":    "Mathew Barzal"       # NHL: two t's, Yahoo: one t
+"Evgeny Dadonov":    "Evgenii Dadonov"     # NHL: Evgeny, Yahoo: Evgenii
+"Jonathon Merrill":  "Jon Merrill"         # Covered by nickname but added for safety
+
+# Add more below as discovered:
+# "NHL Name": "Yahoo Name"

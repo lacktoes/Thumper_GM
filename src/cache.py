@@ -47,15 +47,17 @@ def init_players_db():
                 points REAL, fetched_at TEXT
             )
         """)
-        _migrate_table(con, "roster_membership", {"status", "injury_note"}, """
+        _migrate_table(con, "roster_membership", {"status", "injury_note", "name", "yahoo_position"}, """
             CREATE TABLE IF NOT EXISTS roster_membership (
-                player_id   INTEGER PRIMARY KEY,
-                team_number INTEGER,
-                team_name   TEXT,
-                is_fa       INTEGER,
-                status      TEXT,
-                injury_note TEXT,
-                fetched_at  TEXT
+                player_id    INTEGER PRIMARY KEY,
+                team_number  INTEGER,
+                team_name    TEXT,
+                is_fa        INTEGER,
+                yahoo_position TEXT,
+                name         TEXT,
+                status       TEXT,
+                injury_note  TEXT,
+                fetched_at   TEXT
             )
         """)
         _migrate_table(con, "game_logs", {"game_id", "HIT", "BLK", "FOW"}, """
@@ -128,9 +130,9 @@ def save_roster_membership(rows: list[dict]):
         con.execute("DELETE FROM roster_membership")
         con.executemany("""
             INSERT OR REPLACE INTO roster_membership
-              (player_id, team_number, team_name, is_fa, status, injury_note, fetched_at)
-            VALUES (:player_id, :team_number, :team_name, :is_fa, :status, :injury_note, :fetched_at)
-        """, [{**r, "fetched_at": now} for r in rows])
+              (player_id, team_number, team_name, is_fa, name, yahoo_position, status, injury_note, fetched_at)
+            VALUES (:player_id, :team_number, :team_name, :is_fa, :name, :yahoo_position, :status, :injury_note, :fetched_at)
+        """, [{**r, "name": r.get("name", ""), "yahoo_position": r.get("yahoo_position", ""), "fetched_at": now} for r in rows])
 
 
 def load_roster_membership() -> dict[int, dict]:
@@ -149,6 +151,12 @@ def roster_stale(ttl_hours: int = 4) -> bool:
 
 
 # ── Game logs (recent form + injury detection) ────────────────────────────────
+
+def clear_game_logs():
+    """Delete all rows from game_logs so a full season re-fetch can run."""
+    with _players_conn() as con:
+        con.execute("DELETE FROM game_logs")
+
 
 def save_game_logs(rows: list[dict]):
     """

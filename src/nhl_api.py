@@ -85,7 +85,7 @@ def fetch_skaters(season_id: int) -> list[dict]:
         merged.append({
             "player_id": pid,
             "name":      s.get("skaterFullName", "Unknown"),
-            "team":      s.get("teamAbbrevs", ""),
+            "team":      s.get("teamAbbrevs", "").split(",")[-1],
             "position":  pos,
             "gp":        int(s.get("gamesPlayed", 0) or 0),
             "G":         float(s.get("goals",             0) or 0),

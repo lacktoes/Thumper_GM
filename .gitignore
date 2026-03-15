@@ -3,4 +3,5 @@ __pycache__/
 .env
 data/*.db
 data/exports/
+data/user_prefs.json
 .streamlit/secrets.toml

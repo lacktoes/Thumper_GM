@@ -202,11 +202,13 @@ def fetch_all_rosters(league_key: str, total_teams: int = 12) -> dict[int, dict]
                 if pid is None:
                     continue
                 result[pid] = {
-                    "team_number": team_num,
-                    "team_name":   team_name,
-                    "is_fa":       False,
-                    "status":      info["status"],
-                    "injury_note": info["injury_note"],
+                    "team_number":   team_num,
+                    "team_name":     team_name,
+                    "is_fa":         False,
+                    "name":          info["name"],
+                    "status":        info["status"],
+                    "injury_note":   info["injury_note"],
+                    "yahoo_position": info["position"],
                 }
 
             print(f"  [yahoo] team {team_num:2d} ({team_name}): {count} players")
@@ -226,10 +228,12 @@ def build_roster_membership(
     for pid in all_skater_ids:
         if pid not in result:
             result[pid] = {
-                "team_number": 0,
-                "team_name":   "Free Agent",
-                "is_fa":       True,
-                "status":      "",
-                "injury_note": "",
+                "team_number":    0,
+                "team_name":      "Free Agent",
+                "is_fa":          True,
+                "name":           "",
+                "status":         "",
+                "injury_note":    "",
+                "yahoo_position": "",
             }
     return result

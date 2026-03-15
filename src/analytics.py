@@ -7,17 +7,90 @@ Recent form (last N days):
   - HIT, BLK, FOW are NOT available at per-game level from the NHL API;
     their recent form is approximated from season per-game averages
   - recent_form_z = Z-score of per-game averages over the last N days
-  - injury_flag   = consecutive games missed >= 3 (or Yahoo status not "")
+  - injury_flag   = Yahoo status in INJURY_WARN_CODES (IR, O, DTD, etc.)
 """
 from __future__ import annotations
 
+import unicodedata
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from .schedule import games_in_window, game_dates_in_window, light_nights
-from .nhl_api  import detect_missed_games
+
+
+def _norm(name: str) -> str:
+    """Strip accents, lowercase, alphanumeric only.  Stützle → stutzle, J.J. → jj."""
+    nfkd = unicodedata.normalize("NFKD", str(name))
+    ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
+    return "".join(c for c in ascii_only.lower() if c.isalnum())
+
+
+# Common first-name nicknames → canonical form.
+# Applied as a prefix match on the normalized slug so we don't need to split on spaces.
+_NICKNAME_MAP: dict[str, str] = {
+    "alexandre": "alexander",
+    "matthew":   "matthew",   # keep as-is but catch "matt" / "matty" below
+    "jonathan":  "jonathan",  # keep; catch "jon" below
+    "mikey":     "michael",
+    "mike":      "michael",
+    "matt":      "matthew",
+    "matty":     "matthew",
+    "jon":       "jonathan",
+    "tony":      "anthony",
+    "alex":      "alexander",
+    "cam":       "cameron",
+    "josh":      "joshua",
+    "pat":       "patrick",
+    "will":      "william",
+    "zach":      "zachary",
+    "andy":      "andrew",
+    "nick":      "nicholas",
+    "vince":     "vincent",
+    "jake":      "jacob",
+    "danny":     "daniel",
+    "dan":       "daniel",
+    "tommy":     "thomas",
+    "tom":       "thomas",
+    "rob":       "robert",
+    "bobby":     "robert",
+    "jeff":      "jeffrey",
+    "chris":     "christopher",
+    "stevie":    "steven",
+    "steve":     "steven",
+    "freddie":   "fredrick",
+    "fred":      "fredrick",
+}
+# Sort longest-first so "mikey" is tried before "mike"
+_NICKNAME_SORTED = sorted(_NICKNAME_MAP.items(), key=lambda x: -len(x[0]))
+
+
+def _canon(slug: str) -> str:
+    """Expand a first-name nickname in a normalized slug to its canonical form."""
+    for nick, canon in _NICKNAME_SORTED:
+        if slug.startswith(nick):
+            rest = slug[len(nick):]
+            if rest:          # must have a last-name component
+                return canon + rest
+    return slug
+
+
+def _load_name_overrides() -> dict[str, str]:
+    """
+    Load data/name_overrides.yaml → {nhl_normalized_slug: yahoo_normalized_slug}.
+    Returns empty dict if file missing.
+    """
+    path = Path(__file__).parent.parent / "data" / "name_overrides.yaml"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    # Normalize keys and values for robustness
+    return {_norm(k): _norm(v) for k, v in data.items()}
+
 
 CATS = ["G", "A", "FOW", "PIM", "PP", "S", "HIT", "BLK"]
 
@@ -37,26 +110,35 @@ def calculate_z_scores(
     weights: dict[str, float],
     universe_size: int = 350,
     suffix: str = "",              # e.g. "_recent" for recent-form columns
-    per_game: bool = False,        # if True, normalise cats by GP first
+    per_game: bool = True,         # normalise by GP before scoring
+    min_gp: int = 10,              # minimum GP to qualify for the reference universe
 ) -> pd.DataFrame:
     """
     Compute per-category Z-scores using the top `universe_size` players
-    (by points or by per-game points) as the reference distribution.
+    (ranked by per-game points among those with >= min_gp) as the reference distribution.
+
+    All players are scored against that distribution, including those below min_gp
+    (they simply extrapolate relative to the established mean/std).
 
     Writes {cat}_z{suffix} columns and total_z{suffix} column.
     """
     df = df.copy()
     cats = [c for c in CATS if c in df.columns]
 
+    gp_col = df["gp"].clip(lower=1)
     if per_game:
-        gp_col = df["gp"].clip(lower=1)
-        work   = df[cats].div(gp_col, axis=0)
+        work     = df[cats].div(gp_col, axis=0)
         rank_col = (df["G"] + df["A"]) / gp_col
+        eligible = df["gp"] >= min_gp
     else:
-        work     = df[cats]
+        work     = df[cats].copy()
         rank_col = df["points"]
+        eligible = pd.Series(True, index=df.index)
 
-    universe = work.loc[rank_col.nlargest(universe_size).index]
+    # Universe = top N qualified players by rank_col
+    qualified_rank = rank_col[eligible]
+    universe_idx   = qualified_rank.nlargest(universe_size).index
+    universe       = work.loc[universe_idx]
 
     for cat in cats:
         w = weights.get(cat, 1.0)
@@ -73,18 +155,57 @@ def calculate_z_scores(
     return df
 
 
+# ── Display helpers ────────────────────────────────────────────────────────────
+
+STAT_CATS = ["G", "A", "PP", "S", "HIT", "BLK", "PIM", "FOW"]
+
+
+def per_game_display(df: pd.DataFrame, cats: list[str] | None = None) -> pd.DataFrame:
+    """
+    Return a copy of df with stat columns divided by GP, rounded to 1 decimal.
+    Used by pages to toggle between season totals and per-game averages.
+    """
+    cats = cats or STAT_CATS
+    result = df.copy()
+    gp = result["gp"].clip(lower=1)
+    for cat in cats:
+        if cat in result.columns:
+            result[cat] = (result[cat] / gp).round(1)
+    return result
+
+
 # ── VORP ──────────────────────────────────────────────────────────────────────
 
 def apply_vorp(df: pd.DataFrame, forward_rank: int = 180, defense_rank: int = 80) -> pd.DataFrame:
+    """
+    Compute VORP per player. Multi-position players (e.g. "C,LW" or "D,LW") get
+    the maximum VORP across every position group they are eligible for.
+    """
     df = df.copy()
-    forwards = df[df["position"] != "D"].sort_values("total_z", ascending=False)
-    defence  = df[df["position"] == "D"].sort_values("total_z", ascending=False)
-    f_base = forwards.iloc[forward_rank]["total_z"] if len(forwards) > forward_rank else 0.0
-    d_base = defence.iloc[defense_rank]["total_z"]  if len(defence)  > defense_rank  else 0.0
-    df["vorp"] = df.apply(
-        lambda r: r["total_z"] - (d_base if r["position"] == "D" else f_base),
-        axis=1,
-    )
+
+    _FWD = {"C", "LW", "RW", "W", "F"}
+
+    def _has_fwd(pos: str) -> bool:
+        return bool({p.strip() for p in str(pos).split(",")} & _FWD)
+
+    def _has_def(pos: str) -> bool:
+        return "D" in {p.strip() for p in str(pos).split(",")}
+
+    fwd_pool = df[df["position"].apply(_has_fwd)].sort_values("total_z", ascending=False)
+    def_pool = df[df["position"].apply(_has_def)].sort_values("total_z", ascending=False)
+
+    f_base = fwd_pool.iloc[forward_rank]["total_z"] if len(fwd_pool) > forward_rank else 0.0
+    d_base = def_pool.iloc[defense_rank]["total_z"]  if len(def_pool)  > defense_rank  else 0.0
+
+    def _vorp(pos: str, z: float) -> float:
+        options = []
+        if _has_fwd(pos):
+            options.append(z - f_base)
+        if _has_def(pos):
+            options.append(z - d_base)
+        return max(options) if options else z - f_base
+
+    df["vorp"] = df.apply(lambda r: _vorp(r["position"], r["total_z"]), axis=1)
     return df
 
 
@@ -101,12 +222,16 @@ def add_schedule_density(
     if today is None:
         today = date.today().isoformat()
 
+    df["games_3d"]      = df["team"].apply(lambda t: games_in_window(schedule, t, today, 3))
     df["games_7d"]      = df["team"].apply(lambda t: games_in_window(schedule, t, today, short_window))
     df["games_14d"]     = df["team"].apply(lambda t: games_in_window(schedule, t, today, long_window))
+    df["density_3d"]    = df["games_3d"]  / 3
     df["density_7d"]    = df["games_7d"]  / short_window
     df["density_14d"]   = df["games_14d"] / long_window
+    df["value_3d"]      = df["total_z"]   * df["density_3d"]
     df["value_7d"]      = df["total_z"]   * df["density_7d"]
     df["game_dates_7d"] = df["team"].apply(lambda t: game_dates_in_window(schedule, t, today, short_window))
+    df["game_dates_3d"] = df["team"].apply(lambda t: game_dates_in_window(schedule, t, today, 3))
     return df
 
 
@@ -124,12 +249,8 @@ def add_recent_form(
     """
     Adds columns:
       recent_gp            – games played in last n_days
-      recent_{cat}_pg      – per-game average in last n_days (GAMELOG_AVAIL cats)
-      {cat}_recent_pg      – per-game from game log (or season rate for HIT/BLK/FOW)
+      {cat}_rpg            – per-game average in last n_days (all 8 GAMELOG_AVAIL cats)
       total_z_recent       – Z-score from recent per-game averages
-      consecutive_missed   – most recent streak of missed team games
-      missed_last_14d      – games missed vs team schedule in last 14 days
-      injury_flag          – True if consecutive_missed >= 3
     """
     df = df.copy()
     if today is None:
@@ -139,11 +260,9 @@ def add_recent_form(
 
     # --- per-player recent stats ---
     recent_rows: dict[int, dict] = {}
-    missed_rows: dict[int, dict] = {}
 
     for _, row in df.iterrows():
         pid  = row["player_id"]
-        team = row["team"]
         log  = game_logs.get(pid, [])
 
         # Filter to last n_days
@@ -158,16 +277,9 @@ def add_recent_form(
 
         recent_rows[pid] = {"recent_gp": rgp, **{f"{cat}_rpg": v for cat, v in pg_avail.items()}}
 
-        # Injury detection: team schedule in last 14 days
-        team_dates = game_dates_in_window(schedule, team, cutoff, n_days)
-        missed_rows[pid] = detect_missed_games(log, team_dates)
-
     # Attach to df
     for col in ["recent_gp"] + [f"{c}_rpg" for c in CATS]:
         df[col] = df["player_id"].map(lambda pid, c=col: recent_rows.get(pid, {}).get(c, 0.0))
-
-    for col in ["consecutive_missed", "missed_last_14d", "injury_flag"]:
-        df[col] = df["player_id"].map(lambda pid, c=col: missed_rows.get(pid, {}).get(c, 0))
 
     # --- Recent form Z-score ---
     # Build a temp df with per-game recent averages as the stat columns
@@ -178,21 +290,23 @@ def add_recent_form(
     # Only calculate for players with recent_gp >= 2 (avoid noise from 0-1 game samples)
     temp.loc[temp["recent_gp"] < 2, CATS] = np.nan
 
-    temp = calculate_z_scores(temp, weights, universe_size=universe_size, suffix="_recent")
-    df["total_z_recent"] = temp["total_z_recent"].round(3)
+    # The _rpg columns are already per-game averages, so per_game=False here.
+    # Use recent_gp as the GP proxy so min_gp applies to the recent window.
+    temp["gp"] = temp["recent_gp"].clip(lower=1)
+    temp = calculate_z_scores(temp, weights, universe_size=universe_size,
+                              suffix="_recent", per_game=False, min_gp=2)
+    df["total_z_recent"] = temp["total_z_recent"].round(1)
 
     return df
 
 
 # ── Injury status string ──────────────────────────────────────────────────────
 
-def injury_label(status: str, injury_note: str, injury_flag: bool) -> str:
+def injury_label(status: str, injury_note: str) -> str:
     """Return a short human-readable status string for display."""
     if status in INJURY_WARN_CODES:
         note = f" — {injury_note}" if injury_note else ""
         return f"⚠️ {status}{note}"
-    if injury_flag:
-        return "🔴 Possible injury (missed 3+ games)"
     return "✅ Active"
 
 
@@ -215,14 +329,49 @@ def build_player_df(
         today = date.today().isoformat()
 
     # Roster membership + injury status from Yahoo
-    df["team_number"] = df["player_id"].map(lambda p: roster.get(p, {}).get("team_number", 0))
-    df["fantasy_team"]= df["player_id"].map(lambda p: roster.get(p, {}).get("team_name", "Free Agent"))
-    df["is_fa"]       = df["player_id"].map(lambda p: roster.get(p, {}).get("is_fa", True))
-    df["status"]      = df["player_id"].map(lambda p: roster.get(p, {}).get("status", ""))
-    df["injury_note"] = df["player_id"].map(lambda p: roster.get(p, {}).get("injury_note", ""))
+    # Resolution layers (in priority order):
+    #   1. Exact normalized slug  (handles accents via NFKD)
+    #   2. Canonical first-name   (Mike→Michael, Matt→Matthew, Jon→Jonathan, etc.)
+    #   3. data/name_overrides.yaml (Mathew→Matthew, Evgenii→Evgeny, etc.)
+    _overrides = _load_name_overrides()   # {nhl_slug: yahoo_slug}
 
-    # Z-scores + VORP
-    df = calculate_z_scores(df, weights, universe_size=cfg.get("universe_size", 350))
+    _name_roster: dict[str, dict] = {}
+    for v in roster.values():
+        if not v.get("name"):
+            continue
+        slug  = _norm(v["name"])
+        canon = _canon(slug)
+        _name_roster[slug]  = v
+        if canon != slug:
+            _name_roster[canon] = v
+
+    # Add override aliases: NHL slug → same Yahoo entry as the override target
+    for nhl_slug, yahoo_slug in _overrides.items():
+        if yahoo_slug in _name_roster:
+            _name_roster[nhl_slug] = _name_roster[yahoo_slug]
+
+    def _rlookup(n: str) -> dict:
+        slug = _norm(n)
+        return (
+            _name_roster.get(slug)
+            or _name_roster.get(_canon(slug))
+            or {}
+        )
+
+    df["team_number"] = df["name"].map(lambda n: _rlookup(n).get("team_number", 0))
+    df["fantasy_team"]= df["name"].map(lambda n: _rlookup(n).get("team_name", "Free Agent"))
+    df["is_fa"]       = df["name"].map(lambda n: bool(_rlookup(n).get("is_fa", True)))
+    df["status"]      = df["name"].map(lambda n: _rlookup(n).get("status", ""))
+    df["injury_note"] = df["name"].map(lambda n: _rlookup(n).get("injury_note", ""))
+
+    # Override NHL position with Yahoo's multi-position string when available
+    # Yahoo uses "LW", "RW", "C,LW", "D" etc. — richer than NHL's single code
+    _yahoo_pos = df["name"].map(lambda n: _rlookup(n).get("yahoo_position", ""))
+    df["position"] = _yahoo_pos.where(_yahoo_pos != "", df["position"])
+
+    # Z-scores + VORP  (per-game rates, universe = top N players with ≥10 GP)
+    df = calculate_z_scores(df, weights, universe_size=cfg.get("universe_size", 350),
+                            per_game=True, min_gp=cfg.get("min_gp_universe", 10))
     df = apply_vorp(
         df,
         forward_rank=cfg.get("vorp", {}).get("forward_rank", 180),
@@ -245,20 +394,22 @@ def build_player_df(
             n_days=n_days, today=today,
         )
     else:
-        for col in ["recent_gp", "consecutive_missed", "missed_last_14d",
-                    "injury_flag", "total_z_recent"]:
+        for col in ["recent_gp", "total_z_recent"]:
             df[col] = 0
+
+    # injury_flag driven solely by Yahoo status codes
+    df["injury_flag"] = df["status"].isin(INJURY_WARN_CODES)
 
     # Unified injury label
     df["injury_status"] = df.apply(
-        lambda r: injury_label(r["status"], r["injury_note"], bool(r["injury_flag"])),
+        lambda r: injury_label(r["status"], r["injury_note"]),
         axis=1,
     )
 
     # Round display columns
-    for col in ["total_z", "total_z_recent", "vorp", "value_7d"]:
+    for col in ["total_z", "total_z_recent", "vorp", "value_3d", "value_7d"]:
         if col in df.columns:
-            df[col] = df[col].round(3)
+            df[col] = df[col].round(1)
 
     return df
 
@@ -271,22 +422,41 @@ def get_streamers(
     today: str | None = None,
     short_window: int = 7,
     top_n: int = 30,
+    rank_by: str = "value_7d",   # "value_3d" or "value_7d"
 ) -> pd.DataFrame:
     if today is None:
         today = date.today().isoformat()
 
-    fa = df[df["is_fa"]].copy().sort_values("value_7d", ascending=False)
+    fa = df[df["is_fa"]].copy()
 
-    ln = light_nights(schedule, today, short_window)
-    fa["plays_light_night"] = fa["game_dates_7d"].apply(
-        lambda dates: any(d in ln for d in dates)
-    )
+    # Compute 3d values if not present (stale cache fallback)
+    if "value_3d" not in fa.columns or "games_3d" not in fa.columns:
+        fa["games_3d"] = fa["team"].apply(lambda t: games_in_window(schedule, t, today, 3))
+        fa["value_3d"] = (fa["total_z"] * fa["games_3d"] / 3).round(1)
+        fa["game_dates_3d"] = fa["team"].apply(
+            lambda t: game_dates_in_window(schedule, t, today, 3)
+        )
+
+    sort_col = rank_by if rank_by in fa.columns else "value_7d"
+    fa = fa.sort_values(sort_col, ascending=False)
+
+    # Light nights based on active window
+    window_days = 3 if rank_by == "value_3d" else short_window
+    ln = light_nights(schedule, today, window_days)
+    dates_col = "game_dates_3d" if rank_by == "value_3d" else "game_dates_7d"
+    if dates_col in fa.columns:
+        fa["plays_light_night"] = fa[dates_col].apply(
+            lambda dates: any(d in ln for d in dates)
+        )
+    else:
+        fa["plays_light_night"] = False
 
     cols = ["name", "team", "position", "gp", "status",
             "G", "A", "PP", "S", "HIT", "BLK", "PIM", "FOW",
             "total_z", "total_z_recent", "vorp",
-            "games_7d", "games_14d", "value_7d", "plays_light_night",
-            "consecutive_missed", "missed_last_14d", "injury_flag", "injury_status"]
+            "games_3d", "games_7d", "games_14d",
+            "value_3d", "value_7d", "plays_light_night",
+            "injury_flag", "injury_status"]
     return fa[[c for c in cols if c in fa.columns]].head(top_n).reset_index(drop=True)
 
 
@@ -297,40 +467,56 @@ def get_drop_suggestions(
     my_team_number: int,
     drop_threshold: float = 0.5,
     top_fa_n: int = 10,
+    position_match: bool = True,
 ) -> pd.DataFrame:
+    """
+    For each rostered player, find the best available FA who shares at least one
+    position with them (when position_match=True). Returns one row per rostered
+    player where a better FA exists above the threshold, sorted by Drop Score.
+    """
     my_roster = df[df["team_number"] == my_team_number].copy()
-    top_fa    = (df[df["is_fa"] & ~df["injury_flag"].astype(bool)]
-                 .sort_values("value_7d", ascending=False)
-                 .head(top_fa_n))
+
+    # Wider FA pool so position matching has enough candidates
+    fa_pool = (df[df["is_fa"] & ~df["injury_flag"].astype(bool)]
+               .sort_values("value_7d", ascending=False)
+               .head(top_fa_n * 4))
+
+    def _positions(pos_str: str) -> set[str]:
+        return {p.strip() for p in str(pos_str).split(",") if p.strip()}
 
     suggestions = []
-    for _, fa_row in top_fa.iterrows():
-        for _, my_row in my_roster.iterrows():
+    for _, my_row in my_roster.iterrows():
+        my_pos = _positions(my_row["position"])
+
+        best_score  = -999.0
+        best_fa_row = None
+
+        for _, fa_row in fa_pool.iterrows():
+            if position_match:
+                fa_pos = _positions(fa_row["position"])
+                if not (my_pos & fa_pos):
+                    continue
             drop_score = fa_row["value_7d"] - my_row["value_7d"]
-            if drop_score > drop_threshold:
-                suggestions.append({
-                    "Drop (Rostered)":   my_row["name"],
-                    "Drop Status":       my_row.get("injury_status", ""),
-                    "Add (Free Agent)":  fa_row["name"],
-                    "Drop Z":            my_row["total_z"],
-                    "Add Z":             fa_row["total_z"],
-                    "Drop Z (Recent)":   my_row.get("total_z_recent", 0),
-                    "Add Z (Recent)":    fa_row.get("total_z_recent", 0),
-                    "Drop Games (7d)":   my_row["games_7d"],
-                    "Add Games (7d)":    fa_row["games_7d"],
-                    "Drop Value":        my_row["value_7d"],
-                    "Add Value":         fa_row["value_7d"],
-                    "Drop Score":        round(drop_score, 3),
-                    "Drop Team":         my_row["team"],
-                    "Add Team":          fa_row["team"],
-                    "Drop Pos":          my_row["position"],
-                    "Add Pos":           fa_row["position"],
-                })
+            if drop_score > best_score:
+                best_score  = drop_score
+                best_fa_row = fa_row
+
+        if best_fa_row is not None and best_score > drop_threshold:
+            suggestions.append({
+                "Drop (Rostered)":  my_row["name"],
+                "Pos":              my_row["position"],
+                "Drop Value":       round(float(my_row["value_7d"]), 1),
+                "Drop Z":           round(float(my_row["total_z"]), 1),
+                "Drop Status":      my_row.get("injury_status", ""),
+                "Add (Free Agent)": best_fa_row["name"],
+                "FA Pos":           best_fa_row["position"],
+                "Add Value":        round(float(best_fa_row["value_7d"]), 1),
+                "Add Z":            round(float(best_fa_row["total_z"]), 1),
+                "Add Games (7d)":   int(best_fa_row["games_7d"]),
+                "Drop Score":       round(best_score, 1),
+            })
 
     result = pd.DataFrame(suggestions)
     if not result.empty:
-        result = (result
-                  .sort_values("Drop Score", ascending=False)
-                  .drop_duplicates(subset=["Add (Free Agent)"])
-                  .reset_index(drop=True))
+        result = result.sort_values("Drop Score", ascending=False).reset_index(drop=True)
     return result

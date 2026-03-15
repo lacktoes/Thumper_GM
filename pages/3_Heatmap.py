@@ -80,7 +80,7 @@ rows_html = []
 for _, row in my.iterrows():
     team       = row["team"]
     z          = float(row["total_z_recent"] if use_recent and "total_z_recent" in row else row["total_z"])
-    is_injured = bool(row.get("injury_flag")) or str(row.get("status", "")) in {"IR", "IR-LT", "IL", "O"}
+    is_injured = bool(row.get("injury_flag"))
     inj_badge  = " ⚠️" if is_injured else ""
 
     name_cell = (
@@ -134,11 +134,10 @@ st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 # ── Injury detail ─────────────────────────────────────────────────────────────
 
-injured = my[my["injury_flag"].astype(bool) | my["status"].isin(["IR", "IR-LT", "IL", "O"])]
+injured = my[my["injury_flag"].astype(bool)]
 if not injured.empty:
     st.divider()
     st.subheader("⚠️ Injury / Availability Concerns")
-    inj_cols = ["name", "team", "position", "status", "injury_note",
-                "consecutive_missed", "missed_last_14d", "injury_status"]
+    inj_cols = ["name", "team", "position", "status", "injury_note", "injury_status"]
     st.dataframe(injured[[c for c in inj_cols if c in injured.columns]].reset_index(drop=True),
                  use_container_width=True, hide_index=True)
