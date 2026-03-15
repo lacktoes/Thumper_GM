@@ -175,6 +175,47 @@ def _extract_player_info(player_arr: list) -> dict:
     }
 
 
+# ── FA position fetch ─────────────────────────────────────────────────────────
+
+def fetch_fa_positions(league_key: str, max_players: int = 400) -> dict[str, str]:
+    """
+    Paginate through Yahoo free agents and return {player_name: display_position}.
+    Used to fill in multi-position data for players not on any roster.
+    """
+    hdrs      = _headers()
+    positions: dict[str, str] = {}
+    start     = 0
+    page_size = 25
+
+    while start < max_players:
+        try:
+            data = _api_get(
+                f"league/{league_key}/players;status=A;start={start};count={page_size}",
+                hdrs,
+            )
+            players = data["fantasy_content"]["league"][1]["players"]
+            n = players.get("count", 0)
+            if n == 0:
+                break
+            for i in range(n):
+                p_arr = players[str(i)]["player"]
+                info  = _extract_player_info(p_arr)
+                name  = info.get("name", "")
+                pos   = info.get("position", "")
+                if name and pos:
+                    positions[name] = pos
+            start += n
+            if n < page_size:
+                break
+            time.sleep(0.15)
+        except Exception as exc:
+            print(f"  [yahoo] FA position fetch error at start={start}: {exc}")
+            break
+
+    print(f"  [yahoo] fetched positions for {len(positions)} available players")
+    return positions
+
+
 # ── Roster fetch ──────────────────────────────────────────────────────────────
 
 def fetch_all_rosters(league_key: str, total_teams: int = 12) -> dict[int, dict]:

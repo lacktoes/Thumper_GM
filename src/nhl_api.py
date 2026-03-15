@@ -80,6 +80,9 @@ def fetch_skaters(season_id: int) -> list[dict]:
         pos = s.get("positionCode", "")
         if pos == "G":
             continue
+        # Expand NHL single-letter codes to full names used by Yahoo
+        _POS_MAP = {"L": "LW", "R": "RW", "C": "C", "D": "D"}
+        pos = _POS_MAP.get(pos, pos)
         rt = rt_idx.get(pid, {})
         fo = fo_idx.get(pid, {})
         merged.append({

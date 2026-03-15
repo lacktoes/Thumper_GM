@@ -30,7 +30,7 @@ from src.cache        import (
 )
 from src.nhl_api      import fetch_skaters, fetch_per_game_stats, SEASON_START
 from src.schedule     import fetch_schedule
-from src.yahoo_fantasy import fetch_all_rosters, build_roster_membership
+from src.yahoo_fantasy import fetch_all_rosters, build_roster_membership, fetch_fa_positions
 from src.analytics    import build_player_df, per_game_display, STAT_CATS
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -170,10 +170,20 @@ if refresh_roster or roster_stale(cfg["cache_ttl_hours"]):
                 skater_list  = load_skaters()
                 yahoo_roster = fetch_all_rosters(league_key, cfg["total_teams"])
                 merged       = build_roster_membership(yahoo_roster, [s["player_id"] for s in skater_list])
-                save_roster_membership([
-                    {"player_id": pid, **info}
-                    for pid, info in merged.items()
-                ])
+            with st.spinner("Fetching FA positions from Yahoo…"):
+                fa_positions = fetch_fa_positions(league_key)
+                # Backfill yahoo_position for FAs using Yahoo's display_position
+                for pid, info in merged.items():
+                    if info["is_fa"] and not info["yahoo_position"]:
+                        name = next(
+                            (s["name"] for s in skater_list if s["player_id"] == pid), ""
+                        )
+                        if name and name in fa_positions:
+                            info["yahoo_position"] = fa_positions[name]
+            save_roster_membership([
+                {"player_id": pid, **info}
+                for pid, info in merged.items()
+            ])
             _data_changed = True
             st.toast(f"Roster synced — {len([v for v in merged.values() if not v['is_fa']])} rostered players.")
         except Exception as exc:
