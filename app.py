@@ -334,3 +334,27 @@ st.caption(
     f"{recent_days} days, all 8 categories (G, A, PP, S, PIM, HIT, BLK, FOW per game).  \n"
     "**Status** = Yahoo Fantasy injury designation (IR, O, DTD, etc.)."
 )
+
+with st.expander("🔎 Game log diagnostics", expanded=False):
+    from src.cache import latest_game_log_date
+    from datetime import timedelta as _td
+    _latest = latest_game_log_date()
+    _cutoff = (date.fromisoformat(today_str) - _td(days=recent_days)).isoformat()
+    _raw_logs = load_game_logs(since_date=_cutoff)
+    _n_players = len(_raw_logs)
+    _n_rows    = sum(len(v) for v in _raw_logs.values())
+    _has_recent = int((df["total_z_recent"] != 0).sum()) if "total_z_recent" in df.columns else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latest game date in DB",  _latest or "None")
+    c2.metric("Players with logs (window)", _n_players)
+    c3.metric("Total game-log rows (window)", _n_rows)
+    c4.metric("Players with non-zero Z Recent", _has_recent)
+
+    if _n_players > 0:
+        import random
+        _sample_pid = next(iter(_raw_logs))
+        _sample_games = _raw_logs[_sample_pid][:3]
+        _sample_name  = df[df["player_id"] == _sample_pid]["name"].values
+        st.caption(f"Sample player_id {_sample_pid} ({_sample_name[0] if len(_sample_name) else '?'}): "
+                   f"{_sample_games}")
