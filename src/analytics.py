@@ -313,13 +313,14 @@ def injury_label(status: str, injury_note: str) -> str:
 # ── Master builder ────────────────────────────────────────────────────────────
 
 def build_player_df(
-    skaters:   list[dict],
-    roster:    dict[int, dict],
-    schedule:  list[dict],
-    game_logs: dict[int, list[dict]],
-    weights:   dict[str, float],
-    cfg:       dict,
-    today:     str | None = None,
+    skaters:     list[dict],
+    roster:      dict[int, dict],
+    schedule:    list[dict],
+    game_logs:   dict[int, list[dict]],
+    weights:     dict[str, float],
+    cfg:         dict,
+    today:       str | None = None,
+    fa_positions: dict[str, str] | None = None,  # {yahoo_name: display_position}
 ) -> pd.DataFrame:
     df = pd.DataFrame(skaters)
     if df.empty:
@@ -367,6 +368,33 @@ def build_player_df(
     # Override NHL position with Yahoo's multi-position string when available
     # Yahoo uses "LW", "RW", "C,LW", "D" etc. — richer than NHL's single code
     _yahoo_pos = df["name"].map(lambda n: _rlookup(n).get("yahoo_position", ""))
+
+    # For players without a yahoo_position in the roster cache (mostly FAs),
+    # try the fa_positions dict using the same normalized name matching.
+    if fa_positions:
+        _fa_lookup: dict[str, str] = {}
+        for yn, ypos in fa_positions.items():
+            slug  = _norm(yn)
+            canon = _canon(slug)
+            _fa_lookup[slug]  = ypos
+            if canon != slug:
+                _fa_lookup[canon] = ypos
+        # Also add override aliases so e.g. "Matthew Barzal" finds "Mathew Barzal"
+        for nhl_slug, yahoo_slug in _overrides.items():
+            if yahoo_slug in _fa_lookup and nhl_slug not in _fa_lookup:
+                _fa_lookup[nhl_slug] = _fa_lookup[yahoo_slug]
+
+        def _fa_pos(n: str, cur: str) -> str:
+            if cur:
+                return cur
+            slug = _norm(n)
+            return _fa_lookup.get(slug) or _fa_lookup.get(_canon(slug)) or cur
+
+        _yahoo_pos = _yahoo_pos.combine(
+            df["name"],
+            lambda cur, n: _fa_pos(n, cur),
+        )
+
     df["position"] = _yahoo_pos.where(_yahoo_pos != "", df["position"])
 
     # Z-scores + VORP  (per-game rates, universe = top N players with ≥10 GP)

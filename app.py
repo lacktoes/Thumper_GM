@@ -170,20 +170,13 @@ if refresh_roster or roster_stale(cfg["cache_ttl_hours"]):
                 skater_list  = load_skaters()
                 yahoo_roster = fetch_all_rosters(league_key, cfg["total_teams"])
                 merged       = build_roster_membership(yahoo_roster, [s["player_id"] for s in skater_list])
+                save_roster_membership([
+                    {"player_id": pid, **info}
+                    for pid, info in merged.items()
+                ])
             with st.spinner("Fetching FA positions from Yahoo…"):
                 fa_positions = fetch_fa_positions(league_key)
-                # Backfill yahoo_position for FAs using Yahoo's display_position
-                for pid, info in merged.items():
-                    if info["is_fa"] and not info["yahoo_position"]:
-                        name = next(
-                            (s["name"] for s in skater_list if s["player_id"] == pid), ""
-                        )
-                        if name and name in fa_positions:
-                            info["yahoo_position"] = fa_positions[name]
-            save_roster_membership([
-                {"player_id": pid, **info}
-                for pid, info in merged.items()
-            ])
+                st.session_state["fa_positions"] = fa_positions
             _data_changed = True
             st.toast(f"Roster synced — {len([v for v in merged.values() if not v['is_fa']])} rostered players.")
         except Exception as exc:
@@ -228,15 +221,16 @@ elif game_logs_need_update(ttl_hours=cfg["cache_ttl_hours"]):
 # ── Load all data ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=cfg["cache_ttl_hours"] * 3600, show_spinner=False)
-def build_df(weights_tuple, today_str, recent_days):
+def build_df(weights_tuple, today_str, recent_days, fa_positions_tuple):
     from datetime import timedelta, datetime as _dt
-    weights    = dict(weights_tuple)
-    skaters    = load_skaters()
-    schedule   = load_schedule()
-    roster     = load_roster_membership()
+    weights      = dict(weights_tuple)
+    fa_positions = dict(fa_positions_tuple)
+    skaters      = load_skaters()
+    schedule     = load_schedule()
+    roster       = load_roster_membership()
     # Only load game logs within the recent form window (+ buffer) to keep memory lean
-    since      = (_dt.fromisoformat(today_str) - timedelta(days=recent_days + 2)).date().isoformat()
-    game_logs  = load_game_logs(since_date=since)
+    since        = (_dt.fromisoformat(today_str) - timedelta(days=recent_days + 2)).date().isoformat()
+    game_logs    = load_game_logs(since_date=since)
 
     if not skaters:
         return None, "No player data. Click '📊 Stats' to fetch from NHL API."
@@ -244,6 +238,7 @@ def build_df(weights_tuple, today_str, recent_days):
     df = build_player_df(
         skaters, roster, schedule, game_logs, weights, cfg,
         today=today_str,
+        fa_positions=fa_positions,
     )
     return df, None
 
@@ -252,7 +247,13 @@ if _data_changed:
     build_df.clear()
 
 with st.spinner("Building player data…"):
-    df, err = build_df(tuple(sorted(weights.items())), today_str, recent_days)
+    _fa_pos = st.session_state.get("fa_positions", {})
+    df, err = build_df(
+        tuple(sorted(weights.items())),
+        today_str,
+        recent_days,
+        tuple(sorted(_fa_pos.items())),
+    )
 
 if err:
     st.error(err)
