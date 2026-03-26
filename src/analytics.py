@@ -100,7 +100,7 @@ GAMELOG_AVAIL = ["G", "A", "PP", "S", "PIM", "HIT", "BLK", "FOW"]
 GAMELOG_RATE  = []   # nothing needs a season-rate fallback
 
 # Injury status codes considered "active concern" (show warning badge)
-INJURY_WARN_CODES = {"IR", "IR-LT", "IL", "O", "DTD", "Q", "GTD"}
+INJURY_WARN_CODES = {"IR", "IR-LT", "IR-LTD", "IL", "O", "DTD", "Q", "GTD", "NA", "SUSP"}
 
 
 # ── Z-score engine ────────────────────────────────────────────────────────────
@@ -362,8 +362,18 @@ def build_player_df(
     df["team_number"] = df["name"].map(lambda n: _rlookup(n).get("team_number", 0))
     df["fantasy_team"]= df["name"].map(lambda n: _rlookup(n).get("team_name", "Free Agent"))
     df["is_fa"]       = df["name"].map(lambda n: bool(_rlookup(n).get("is_fa", True)))
-    df["status"]      = df["name"].map(lambda n: _rlookup(n).get("status", ""))
-    df["injury_note"] = df["name"].map(lambda n: _rlookup(n).get("injury_note", ""))
+
+    # Injury status: try direct player_id lookup first (bypasses name-matching failures),
+    # then fall back to the name-based roster entry.
+    # Both Yahoo Fantasy and the NHL Stats API use the same numeric player IDs.
+    def _status_lookup(pid: int, name: str) -> dict:
+        direct = roster.get(pid) or roster.get(int(pid))
+        if direct and (direct.get("status") or direct.get("injury_note")):
+            return direct
+        return _rlookup(name)
+
+    df["status"]      = df.apply(lambda r: _status_lookup(r["player_id"], r["name"]).get("status", ""), axis=1)
+    df["injury_note"] = df.apply(lambda r: _status_lookup(r["player_id"], r["name"]).get("injury_note", ""), axis=1)
 
     # Override NHL position with Yahoo's multi-position string when available
     # Yahoo uses "LW", "RW", "C,LW", "D" etc. — richer than NHL's single code
@@ -438,6 +448,76 @@ def build_player_df(
     for col in ["total_z", "total_z_recent", "vorp", "value_3d", "value_7d"]:
         if col in df.columns:
             df[col] = df[col].round(1)
+
+    return df
+
+
+# ── Goalie builder ────────────────────────────────────────────────────────────
+
+GOALIE_CATS = ["W", "SVP", "GAA", "SO"]   # SVP = save % as decimal (0.920)
+
+
+def build_goalie_df(
+    goalies:      list[dict],
+    roster:       dict[int, dict],
+    schedule:     list[dict],
+    today:        str | None = None,
+) -> pd.DataFrame:
+    """
+    Build a DataFrame of NHL goalies with roster membership and schedule density.
+
+    Added columns beyond raw stats:
+      team_number, fantasy_team, is_fa, status, injury_note, injury_flag
+      games_3d, games_7d, games_14d
+      W_pg, SO_pg  — per-game rates for Poisson projection
+      SVP, GAA     — already per-game rates by nature
+    """
+    df = pd.DataFrame(goalies)
+    if df.empty:
+        return df
+
+    if today is None:
+        today = date.today().isoformat()
+
+    _overrides    = _load_name_overrides()
+    _name_roster: dict[str, dict] = {}
+    for v in roster.values():
+        if not v.get("name"):
+            continue
+        slug  = _norm(v["name"])
+        canon = _canon(slug)
+        _name_roster[slug]  = v
+        if canon != slug:
+            _name_roster[canon] = v
+    for nhl_slug, yahoo_slug in _overrides.items():
+        if yahoo_slug in _name_roster:
+            _name_roster[nhl_slug] = _name_roster[yahoo_slug]
+
+    def _rlookup(n: str) -> dict:
+        slug = _norm(n)
+        return _name_roster.get(slug) or _name_roster.get(_canon(slug)) or {}
+
+    def _status_lookup(pid: int, name: str) -> dict:
+        direct = roster.get(pid) or roster.get(int(pid))
+        if direct and (direct.get("status") or direct.get("injury_note")):
+            return direct
+        return _rlookup(name)
+
+    df["team_number"]  = df["name"].map(lambda n: _rlookup(n).get("team_number", 0))
+    df["fantasy_team"] = df["name"].map(lambda n: _rlookup(n).get("team_name", "Free Agent"))
+    df["is_fa"]        = df["name"].map(lambda n: bool(_rlookup(n).get("is_fa", True)))
+    df["status"]       = df.apply(lambda r: _status_lookup(r["player_id"], r["name"]).get("status", ""), axis=1)
+    df["injury_note"]  = df.apply(lambda r: _status_lookup(r["player_id"], r["name"]).get("injury_note", ""), axis=1)
+    df["injury_flag"]  = df["status"].isin(INJURY_WARN_CODES)
+    df["injury_status"] = df.apply(lambda r: injury_label(r["status"], r["injury_note"]), axis=1)
+
+    df["games_3d"]  = df["team"].apply(lambda t: games_in_window(schedule, t, today, 3))
+    df["games_7d"]  = df["team"].apply(lambda t: games_in_window(schedule, t, today, 7))
+    df["games_14d"] = df["team"].apply(lambda t: games_in_window(schedule, t, today, 14))
+
+    gp = df["gp"].clip(lower=1)
+    df["W_pg"]  = (df["W"]  / gp).round(3)
+    df["SO_pg"] = (df["SO"] / gp).round(3)
 
     return df
 

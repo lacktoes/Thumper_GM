@@ -261,6 +261,142 @@ def fetch_all_rosters(league_key: str, total_teams: int = 12) -> dict[int, dict]
     return result
 
 
+# ── Weekly matchup (live H2H stats) ──────────────────────────────────────────
+
+# Yahoo returns skater stats positionally; first 8 map to our categories.
+# Order: G, A, PIM, PPP(→PP), SOG(→S), FW(→FOW), HIT, BLK
+_SKATER_CATS = ["G", "A", "PIM", "PP", "S", "FOW", "HIT", "BLK"]
+
+
+def _extract_week_stats(team_node: dict) -> dict[str, float]:
+    """
+    Parse Yahoo team[1] node (from /stats or /matchups endpoint) into
+    {cat: float} for our 8 skater categories using positional indexing.
+    """
+    result = {c: 0.0 for c in _SKATER_CATS}
+    try:
+        stats_list = team_node["team_stats"]["stats"]
+        for i, cat in enumerate(_SKATER_CATS):
+            if i < len(stats_list):
+                val = stats_list[i]["stat"]["value"]
+                try:
+                    result[cat] = float(val)
+                except (ValueError, TypeError):
+                    pass
+    except (KeyError, TypeError, IndexError):
+        pass
+    return result
+
+
+def _fetch_week_dates(league_key: str, week: int, hdrs: dict) -> tuple:
+    """
+    Return (week_start, week_end) ISO strings for the given fantasy week.
+
+    Tries the scoreboard endpoint first.  Falls back to /game/{game_key}/game_weeks
+    which covers non-standard weeks (Christmas break, All-Star, etc.).
+    """
+    # 1. Scoreboard (fastest, usually works)
+    try:
+        sb   = _api_get(f"league/{league_key}/scoreboard;week={week}", hdrs)
+        sc   = sb["fantasy_content"]["league"][1]["scoreboard"]
+        ws   = sc.get("week_start")
+        we   = sc.get("week_end")
+        if ws and we:
+            return ws, we
+    except Exception:
+        pass
+
+    # 2. game_weeks fallback
+    try:
+        game_key = league_key.split(".l.")[0]
+        gw_data  = _api_get(f"game/{game_key}/game_weeks", hdrs)
+        gw_list  = gw_data["fantasy_content"]["game"][1]["game_weeks"]
+        count    = int(gw_list.get("count", 0))
+        for i in range(count):
+            gw = gw_list[str(i)]["game_week"]
+            if int(gw.get("week", -1)) == week:
+                return gw.get("start"), gw.get("end")
+    except Exception:
+        pass
+
+    return None, None
+
+
+def fetch_weekly_matchup(league_key: str, my_team_num: int) -> dict | None:
+    """
+    Fetch live week stats for the current H2H matchup.
+
+    Returns {
+        week, week_start, week_end,
+        my_name, my_num, my_stats, my_logo,
+        opp_name, opp_num, opp_stats, opp_logo,
+    } or None on bye week / offseason.
+    """
+    hdrs = _headers()
+
+    # 1. Current week number from league endpoint
+    lg_data     = _api_get(f"league/{league_key}/", hdrs)
+    league_meta = lg_data["fantasy_content"]["league"][0]
+    cw          = league_meta.get("current_week")
+    week        = int(cw["value"] if isinstance(cw, dict) else cw)
+
+    # 2. My team's cumulative stats for this week
+    my_data = _api_get(
+        f"team/{league_key}.t.{my_team_num}/stats;type=week;week={week}", hdrs
+    )
+    my_team  = my_data["fantasy_content"]["team"]
+    my_name  = next((v["name"] for v in my_team[0] if isinstance(v, dict) and "name" in v),
+                    f"Team {my_team_num}")
+    my_logo  = next((v["team_logos"][0]["team_logo"]["url"]
+                     for v in my_team[0] if isinstance(v, dict) and "team_logos" in v), None)
+    my_stats = _extract_week_stats(my_team[1])
+
+    # 3. Identify opponent via matchup endpoint (returns None on bye week)
+    try:
+        mu_data = _api_get(
+            f"team/{league_key}.t.{my_team_num}/matchups;weeks={week}", hdrs
+        )
+        teams    = (mu_data["fantasy_content"]["team"][1]
+                    ["matchups"]["0"]["matchup"]["0"]["teams"])
+        opp_meta = teams["1"]["team"][0]
+        opp_name = next((v["name"] for v in opp_meta if isinstance(v, dict) and "name" in v),
+                        "Opponent")
+        opp_key  = next((v["team_key"] for v in opp_meta
+                         if isinstance(v, dict) and "team_key" in v), None)
+        opp_logo = next((v["team_logos"][0]["team_logo"]["url"]
+                         for v in opp_meta if isinstance(v, dict) and "team_logos" in v), None)
+        opp_num  = int(opp_key.split(".t.")[-1]) if opp_key else None
+    except (KeyError, IndexError, TypeError):
+        return None   # bye week or no active matchup
+
+    if opp_num is None:
+        return None
+
+    # 4. Week start / end dates (scoreboard first, game_weeks fallback for
+    #    non-standard weeks: holidays, all-star break, etc.)
+    week_start, week_end = _fetch_week_dates(league_key, week, hdrs)
+
+    # 5. Opponent's cumulative stats for this week
+    opp_data  = _api_get(
+        f"team/{league_key}.t.{opp_num}/stats;type=week;week={week}", hdrs
+    )
+    opp_stats = _extract_week_stats(opp_data["fantasy_content"]["team"][1])
+
+    return {
+        "week":        week,
+        "week_start":  week_start,
+        "week_end":    week_end,
+        "my_name":     my_name,
+        "my_num":      my_team_num,
+        "my_stats":    my_stats,
+        "my_logo":     my_logo,
+        "opp_name":    opp_name,
+        "opp_num":     opp_num,
+        "opp_stats":   opp_stats,
+        "opp_logo":    opp_logo,
+    }
+
+
 def build_roster_membership(
     yahoo_roster: dict[int, dict],
     all_skater_ids: list[int],

@@ -47,6 +47,15 @@ def init_players_db():
                 points REAL, fetched_at TEXT
             )
         """)
+        _migrate_table(con, "goalie_stats", {"W", "SVP", "GAA", "SO", "SA", "SV"}, """
+            CREATE TABLE IF NOT EXISTS goalie_stats (
+                player_id  INTEGER PRIMARY KEY,
+                name       TEXT, team TEXT, position TEXT, gp INTEGER,
+                W REAL, L REAL, OTL REAL,
+                SVP REAL, GAA REAL, SO REAL, SA REAL, SV REAL,
+                fetched_at TEXT
+            )
+        """)
         _migrate_table(con, "roster_membership", {"status", "injury_note", "name", "yahoo_position"}, """
             CREATE TABLE IF NOT EXISTS roster_membership (
                 player_id    INTEGER PRIMARY KEY,
@@ -116,6 +125,37 @@ def load_skaters() -> list[dict]:
 def skaters_stale(ttl_hours: int) -> bool:
     with _players_conn() as con:
         row = con.execute("SELECT fetched_at FROM skater_stats LIMIT 1").fetchone()
+    if not row:
+        return True
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["fetched_at"])).total_seconds() / 3600
+    return age > ttl_hours
+
+
+# ── Goalie stats ──────────────────────────────────────────────────────────────
+
+def save_goalies(rows: list[dict]):
+    now = datetime.now(timezone.utc).isoformat()
+    with _players_conn() as con:
+        con.executemany("""
+            INSERT INTO goalie_stats
+              (player_id,name,team,position,gp,W,L,OTL,SVP,GAA,SO,SA,SV,fetched_at)
+            VALUES (:player_id,:name,:team,:position,:gp,:W,:L,:OTL,:SVP,:GAA,:SO,:SA,:SV,:fetched_at)
+            ON CONFLICT(player_id) DO UPDATE SET
+              name=excluded.name, team=excluded.team, position=excluded.position,
+              gp=excluded.gp, W=excluded.W, L=excluded.L, OTL=excluded.OTL,
+              SVP=excluded.SVP, GAA=excluded.GAA, SO=excluded.SO,
+              SA=excluded.SA, SV=excluded.SV, fetched_at=excluded.fetched_at
+        """, [{**r, "fetched_at": now} for r in rows])
+
+
+def load_goalies() -> list[dict]:
+    with _players_conn() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM goalie_stats").fetchall()]
+
+
+def goalies_stale(ttl_hours: int) -> bool:
+    with _players_conn() as con:
+        row = con.execute("SELECT fetched_at FROM goalie_stats LIMIT 1").fetchone()
     if not row:
         return True
     age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["fetched_at"])).total_seconds() / 3600

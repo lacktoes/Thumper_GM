@@ -19,9 +19,10 @@ import requests
 import time
 from datetime import date, timedelta
 
-STATS_BASE = "https://api.nhle.com/stats/rest/en/skater"
-WEB_BASE   = "https://api-web.nhle.com/v1"
-PAGE_SIZE  = 100
+STATS_BASE   = "https://api.nhle.com/stats/rest/en/skater"
+GOALIE_BASE  = "https://api.nhle.com/stats/rest/en/goalie"
+WEB_BASE     = "https://api-web.nhle.com/v1"
+PAGE_SIZE    = 100
 
 SEASON_START = "2025-10-01"   # first day of 2025-26 regular season
 
@@ -56,6 +57,95 @@ def _paginate(endpoint: str, extra_params: dict) -> list[dict]:
 
 
 # ── Season aggregate stats ────────────────────────────────────────────────────
+
+def fetch_team_standings() -> dict[str, dict]:
+    """
+    Fetch current NHL standings from the Web API.
+    Returns {team_abbrev: {gp, w, l, ot, gf, ga, home_gp, home_w, road_gp, road_w}}.
+    Used to compute Pythagorean win probabilities for goalie projections.
+    """
+    url = f"{WEB_BASE}/standings/now"
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        print(f"  [nhl_api] standings fetch error: {exc}")
+        return {}
+
+    result: dict[str, dict] = {}
+    for entry in data.get("standings", []):
+        abbrev = (entry.get("teamAbbrev") or {}).get("default", "")
+        if not abbrev:
+            continue
+        result[abbrev] = {
+            "gp":      int(entry.get("gamesPlayed", 0)    or 0),
+            "w":       int(entry.get("wins", 0)           or 0),
+            "l":       int(entry.get("losses", 0)         or 0),
+            "ot":      int(entry.get("otLosses", 0)       or 0),
+            "gf":      float(entry.get("goalFor", 0)      or 0),
+            "ga":      float(entry.get("goalAgainst", 0)  or 0),
+            "home_gp": int(entry.get("homeGamesPlayed", 0) or 0),
+            "home_w":  int(entry.get("homeWins", 0)       or 0),
+            "road_gp": int(entry.get("roadGamesPlayed", 0) or 0),
+            "road_w":  int(entry.get("roadWins", 0)       or 0),
+        }
+    print(f"  [nhl_api] standings fetched for {len(result)} teams.")
+    return result
+
+
+def fetch_goalies(season_id: int) -> list[dict]:
+    """
+    Fetch season goalie stats from /goalie/summary.
+    Returns [{player_id, name, team, position, gp, W, L, OTL, SVP, GAA, SO, SA, SV}]
+    SVP is stored as a decimal (0.920, not 92.0).
+    """
+    season_exp = f"seasonId={season_id} and gameTypeId=2"
+    rows: list[dict] = []
+    start   = 0
+    session = requests.Session()
+
+    while True:
+        params = {
+            "limit": PAGE_SIZE,
+            "start": start,
+            "sort": "wins",
+            "cayenneExp": season_exp,
+        }
+        try:
+            r = session.get(f"{GOALIE_BASE}/summary", params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json()
+        except Exception as exc:
+            print(f"  [nhl_api] goalie/summary start={start} error: {exc}")
+            break
+
+        for g in payload.get("data", []):
+            rows.append({
+                "player_id": g.get("playerId"),
+                "name":      g.get("goalieFullName", "Unknown"),
+                "team":      (g.get("teamAbbrevs") or "").split(",")[-1],
+                "position":  "G",
+                "gp":        int(g.get("gamesPlayed",        0) or 0),
+                "W":         float(g.get("wins",             0) or 0),
+                "L":         float(g.get("losses",           0) or 0),
+                "OTL":       float(g.get("otLosses",         0) or 0),
+                "SVP":       float(g.get("savePercentage",   0) or 0),  # 0.920, not 92.0
+                "GAA":       float(g.get("goalsAgainstAverage", 0) or 0),
+                "SO":        float(g.get("shutouts",         0) or 0),
+                "SA":        float(g.get("shotsAgainst",     0) or 0),
+                "SV":        float(g.get("saves",            0) or 0),
+            })
+
+        total  = payload.get("total", 0)
+        start += PAGE_SIZE
+        if start >= total:
+            break
+        time.sleep(0.1)
+
+    print(f"  Fetched {len(rows)} goalies.")
+    return rows
+
 
 def fetch_skaters(season_id: int) -> list[dict]:
     """

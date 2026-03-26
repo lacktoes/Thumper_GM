@@ -23,15 +23,16 @@ from datetime import date
 from src.cache        import (
     init_players_db, init_schedule_db,
     save_skaters,    load_skaters,    skaters_stale,
+    save_goalies,    load_goalies,    goalies_stale,
     save_schedule,   load_schedule,   schedule_stale,
     save_roster_membership, load_roster_membership, roster_stale,
     save_game_logs,  load_game_logs,  clear_game_logs,
     latest_game_log_date, game_logs_need_update,
 )
-from src.nhl_api      import fetch_skaters, fetch_per_game_stats, SEASON_START
+from src.nhl_api      import fetch_skaters, fetch_goalies, fetch_per_game_stats, SEASON_START
 from src.schedule     import fetch_schedule
 from src.yahoo_fantasy import fetch_all_rosters, build_roster_membership, fetch_fa_positions
-from src.analytics    import build_player_df, per_game_display, STAT_CATS
+from src.analytics    import build_player_df, build_goalie_df, per_game_display, STAT_CATS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,7 @@ with st.sidebar:
     col_c, col_d = st.columns(2)
     refresh_roster   = col_c.button("👥 Roster",   help="Sync Yahoo Fantasy rosters + injury status")
     refresh_logs     = col_d.button("📈 Form",     help="Fetch new per-game stats since last update")
+    refresh_goalies  = st.button("🥅 Goalies",     help="Refresh NHL goalie season stats", use_container_width=True)
     reset_logs       = st.button("♻️ Reset Game Logs", help="Clear all per-game data and re-fetch full season from scratch", use_container_width=True)
 
 # ── Data refresh ──────────────────────────────────────────────────────────────
@@ -140,6 +142,14 @@ if refresh_stats or skaters_stale(cfg["cache_ttl_hours"]):
         save_skaters(skaters)
     _data_changed = True
     st.toast(f"Loaded {len(skaters)} skaters.")
+
+# 1b. Goalie stats (NHL API)
+if refresh_goalies or goalies_stale(cfg["cache_ttl_hours"]):
+    with st.spinner("Fetching NHL goalie stats…"):
+        goalies = fetch_goalies(cfg["season_id"])
+        save_goalies(goalies)
+    _data_changed = True
+    st.toast(f"Loaded {len(goalies)} goalies.")
 
 # 2. Schedule (NHL API)
 if refresh_schedule or schedule_stale(7):
@@ -228,19 +238,23 @@ def build_df(weights_tuple, today_str, recent_days, fa_positions_tuple):
     skaters      = load_skaters()
     schedule     = load_schedule()
     roster       = load_roster_membership()
-    # Only load game logs within the recent form window (+ buffer) to keep memory lean
     since        = (_dt.fromisoformat(today_str) - timedelta(days=recent_days + 2)).date().isoformat()
     game_logs    = load_game_logs(since_date=since)
 
     if not skaters:
-        return None, "No player data. Click '📊 Stats' to fetch from NHL API."
+        return None, None, "No player data. Click '📊 Stats' to fetch from NHL API."
 
+    _cfg = {**cfg, "recent_form_days": recent_days}
     df = build_player_df(
-        skaters, roster, schedule, game_logs, weights, cfg,
+        skaters, roster, schedule, game_logs, weights, _cfg,
         today=today_str,
         fa_positions=fa_positions,
     )
-    return df, None
+
+    goalies     = load_goalies()
+    goalie_df   = build_goalie_df(goalies, roster, schedule, today=today_str) if goalies else None
+
+    return df, goalie_df, None
 
 
 if _data_changed:
@@ -248,7 +262,7 @@ if _data_changed:
 
 with st.spinner("Building player data…"):
     _fa_pos = st.session_state.get("fa_positions", {})
-    df, err = build_df(
+    df, goalie_df, err = build_df(
         tuple(sorted(weights.items())),
         today_str,
         recent_days,
@@ -262,6 +276,7 @@ if err:
 # Publish to session_state for page modules
 st.session_state.update({
     "df":             df,
+    "goalie_df":      goalie_df,
     "cfg":            cfg,
     "weights":        weights,
     "drop_threshold": drop_threshold,
