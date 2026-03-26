@@ -9,6 +9,7 @@ Row colours:
               Investigate before pickup.
 Heatmap retains ⭐ light-night markers.
 """
+import os
 import streamlit as st
 from datetime import date, timedelta
 from collections import defaultdict
@@ -26,8 +27,11 @@ schedule  = st.session_state["schedule"]
 today_str = st.session_state["today_str"]
 short_w   = cfg.get("schedule_windows", {}).get("short", 7)
 
-from src.analytics import get_streamers, per_game_display, STAT_CATS
-from src.schedule  import light_nights
+from src.analytics      import get_streamers, per_game_display, STAT_CATS, INJURY_WARN_CODES
+from src.schedule       import light_nights
+from src.nhl_api        import SEASON_START
+from src.cache          import latest_game_log_date
+from src.yahoo_fantasy  import fetch_injured_player_status
 
 _LOGO = lambda t: f"https://assets.nhle.com/logos/nhl/svg/{t}_light.svg"
 
@@ -62,26 +66,85 @@ if min_games and games_filter_col in streamers.columns:
 if hide_injured:
     streamers = streamers[~streamers["injury_flag"].astype(bool)]
 
-# ── Scratch-risk flag: low recent participation vs team schedule ───────────────
+# ── FA injury status (Yahoo omits this from roster fetches) ──────────────────
+# Fetch IR/NA player statuses once per session and patch into streamers df so
+# injured FAs (e.g. Draisaitl after being dropped) get injury_flag = True.
 
-recent_days_val = st.session_state.get("recent_days", 14)
-cutoff_start    = (date.fromisoformat(today_str) - timedelta(days=recent_days_val)).isoformat()
+_league_key = os.environ.get("YAHOO_LEAGUE_KEY", "")
+if not _league_key:
+    try:
+        _league_key = st.secrets.get("YAHOO_LEAGUE_KEY", "")
+    except Exception:
+        pass
+
+if _league_key and "injured_player_status" not in st.session_state:
+    try:
+        with st.spinner("Fetching FA injury status from Yahoo…"):
+            st.session_state["injured_player_status"] = fetch_injured_player_status(_league_key)
+    except Exception:
+        st.session_state["injured_player_status"] = {}
+
+_injured_status: dict = st.session_state.get("injured_player_status", {})
+
+# Patch injury_flag for any FA whose player_id appears in the injured list
+if _injured_status:
+    def _patch_injury(row):
+        if row["injury_flag"]:
+            return True
+        pid = row.get("player_id")
+        if pid and pid in _injured_status:
+            status, _ = _injured_status[pid]
+            return status in INJURY_WARN_CODES
+        return False
+    streamers["injury_flag"] = streamers.apply(_patch_injury, axis=1)
+    # Re-apply hide_injured filter now that flags are accurate
+    if hide_injured:
+        streamers = streamers[~streamers["injury_flag"].astype(bool)]
+
+# ── Scratch-risk flag: low recent participation vs expected rate ───────────────
+# Only meaningful when game logs have actually been fetched (recent_gp populated).
+# Flags players whose recent game rate is <50% of their own season rate.
+
+_logs_available  = latest_game_log_date() is not None
+recent_days_val  = st.session_state.get("recent_days", 14)
+cutoff_start     = (date.fromisoformat(today_str) - timedelta(days=recent_days_val)).isoformat()
+season_start_str = SEASON_START
 
 team_recent_games: dict = defaultdict(int)
+team_season_games: dict = defaultdict(int)
 for g in schedule:
-    if cutoff_start <= g["game_date"] < today_str:
+    gd = g["game_date"]
+    if season_start_str <= gd < today_str:
+        team_season_games[g["home_team"]] += 1
+        team_season_games[g["away_team"]] += 1
+    if cutoff_start <= gd < today_str:
         team_recent_games[g["home_team"]] += 1
         team_recent_games[g["away_team"]] += 1
 
 def _scratch_risk(row) -> bool:
-    """True if player has played <60% of their team's recent games (min 4 team games)."""
-    if row.get("injury_flag"):
-        return False          # already shown as injured
-    team_g = team_recent_games.get(row.get("team", ""), 0)
-    if team_g < 4:
+    """
+    True if player's recent game rate is <50% of their own season rate.
+    Returns False immediately if game logs haven't been fetched yet —
+    avoids flagging everyone when recent_gp is 0 across the board.
+    """
+    if not _logs_available:
         return False
-    rgp = float(row.get("recent_gp", 0) or 0)
-    return (rgp / team_g) < 0.6
+    if row.get("injury_flag"):
+        return False
+    team     = row.get("team", "")
+    t_recent = team_recent_games.get(team, 0)
+    t_season = team_season_games.get(team, 0)
+    if t_recent < 4 or t_season < 10:
+        return False
+    player_gp   = float(row.get("gp", 0) or 0)
+    season_rate = player_gp / t_season          # fraction of team games player usually appears in
+    expected    = season_rate * t_recent        # expected appearances in recent window
+    if expected < 1.0:                          # not expected to play much anyway — skip
+        return False
+    rgp = row.get("recent_gp", 0)
+    if rgp != rgp:                              # NaN guard
+        rgp = 0.0
+    return float(rgp) < expected * 0.5         # playing at less than half their expected pace
 
 streamers["_scratch_risk"] = streamers.apply(_scratch_risk, axis=1)
 

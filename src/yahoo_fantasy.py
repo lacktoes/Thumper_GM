@@ -216,6 +216,55 @@ def fetch_fa_positions(league_key: str, max_players: int = 400) -> dict[str, str
     return positions
 
 
+def fetch_injured_player_status(league_key: str) -> dict[int, tuple[str, str]]:
+    """
+    Fetch injury status for ALL players with a non-healthy designation
+    (IR, NA, O, DTD, etc.) regardless of FA/rostered status.
+    Returns {player_id: (status, injury_note)}.
+
+    Yahoo's status=IR filter returns injured-reserve players;
+    status=NA returns not-active (season-ending / traded away).
+    We query both and merge. Used to catch injured FAs whose status
+    is not populated via the normal roster fetch.
+    """
+    hdrs   = _headers()
+    result: dict[int, tuple[str, str]] = {}
+
+    for status_filter in ("IR", "NA"):
+        start     = 0
+        page_size = 25
+        while True:
+            try:
+                data = _api_get(
+                    f"league/{league_key}/players;status={status_filter}"
+                    f";start={start};count={page_size}",
+                    hdrs,
+                )
+                players = data["fantasy_content"]["league"][1]["players"]
+                n = players.get("count", 0)
+                if n == 0:
+                    break
+                for i in range(n):
+                    p_arr = players[str(i)]["player"]
+                    info  = _extract_player_info(p_arr)
+                    pid   = info.get("player_id")
+                    if pid:
+                        result[pid] = (
+                            info.get("status", status_filter),
+                            info.get("injury_note", ""),
+                        )
+                start += n
+                if n < page_size:
+                    break
+                time.sleep(0.15)
+            except Exception as exc:
+                print(f"  [yahoo] injured player fetch ({status_filter}) error: {exc}")
+                break
+
+    print(f"  [yahoo] fetched injury status for {len(result)} players")
+    return result
+
+
 # ── Roster fetch ──────────────────────────────────────────────────────────────
 
 def fetch_all_rosters(league_key: str, total_teams: int = 12) -> dict[int, dict]:
