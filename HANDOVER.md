@@ -305,65 +305,84 @@ current flat `data.json` and the multi-season format from §6.
 
 ---
 
-## 6. Track 1 — year filter (PWW site)
+## 6. Track 1 — year filter (PWW site) — **BUILT**
 
-### Recommended data model
+Shipped on `pww-hockey` branch `claude/quirky-dijkstra-iryhl2`. See
+`scripts/README.md` in that repo for the full pipeline docs.
 
-Do **not** nest all seasons in one `data.json` — twelve seasons at ~190 KB each
-is a 2 MB blocking fetch on a phone. Split by season with a manifest:
+### Data model (implemented)
 
 ```
-docs/seasons.json          manifest: season -> league_key (written by discover_leagues.py)
-docs/data-2025-26.json     one file per season, existing shape unchanged
-docs/data-2026-27.json
-docs/data.json             KEEP as a symlink/copy of the current season
+docs/league_keys.json      season -> league key    (discover_leagues.py)
+docs/data-<season>.json    one file per season     (fetch_data.py)
+docs/seasons.json          front-end manifest      (fetch_data.py)
+docs/data.json             current-season mirror, kept for compatibility
 ```
 
-Keeping `data.json` pointing at the current season means the existing front end
-keeps working untouched while the selector is built.
+Per-season files rather than one nested document: twelve seasons at ~190 KB
+each would be a 2 MB blocking fetch on a phone, and the page only ever shows
+one season at a time.
 
-### Migration
+2025-26 has been migrated to `docs/data-2025-26.json`, and
+`matchup_overrides.json` re-keyed as `{season: {week: [...]}}` with a
+backwards-compatible read for the old week-keyed shape.
 
-1. `cp docs/data.json docs/data-2025-26.json`
-2. Add `"season": "2025-26"` to its `meta`
-3. Leave `data.json` in place until the selector ships
+### `fetch_data.py` (rewritten, season-aware)
 
-### `fetch_data.py` changes
+```bash
+python scripts/fetch_data.py                            # current season (what the Action runs)
+python scripts/fetch_data.py --list                     # what is configured / already fetched
+python scripts/fetch_data.py --season 2024-25           # one season
+python scripts/fetch_data.py --backfill --skip-complete # full history, resumable
+```
 
-- Read `docs/seasons.json`; default to the `current` season
-- `--season 2019-20` to refetch a specific year
-- `--backfill` to walk every season in the manifest
-- Write to `docs/data-{season}.json`, and mirror the current season to `data.json`
-- Rate-limit the backfill. 12 seasons × ~22 weeks × 12 teams × 2 calls ≈
-  **6,000+ Yahoo calls.** Run it once, locally, not in the Action. Expect
-  throttling; make it resumable (skip any season file already complete).
+Pacing via `YAHOO_CALL_DELAY` (default 0.12s). A season is roughly
+`weeks × teams × 2` calls — about 500 — so twelve years is 6,000+. Run it
+locally, not in the Action.
 
-### Front-end
+### Two bugs fixed that only surface on historical data
 
-Season `<select>` in `.header-inner` beside the existing week nav. On change,
-fetch that season's file and re-run `init()`. `app.js` already rebuilds
-everything from `appData`, so this is mostly bootstrap plumbing — `availWeeks`,
-`selectWeek`, and the season-tab render all key off `appData`.
+- **`is_current` was derived from `week == current_week`.** Yahoo keeps
+  reporting a `current_week` for seasons that ended years ago, so every
+  backfilled season would have marked its final week as in progress and
+  **excluded it from the standings**. Now read from the league's `is_finished`
+  flag, which also retro-clears the flag on stored weeks.
+- **League size was taken from `TOTAL_TEAMS`.** The league has not always had
+  twelve teams; `num_teams` from the manifest now wins.
 
-### The team-identity trap
+### Front end
 
-`data.json` keys teams by **display name**. Managers rename teams between
-seasons, so cross-season joins on name will silently produce wrong history.
-Before any multi-season standings or records-across-time feature:
+Season `<select>` in the header, styled to the existing dark theme. Season and
+week are reflected in the URL hash (`#season=2024-25&week=12`) so links are
+shareable, with a `hashchange` listener for back/forward.
 
-- Capture Yahoo's stable `team_key` / `manager guid` during the backfill
-- Key cross-season aggregates on **manager**, not team name
-- Keep team name as a per-season display label only
+**Degrades gracefully:** with no `seasons.json` it loads `data.json` and hides
+the picker, so the live site keeps working before the backfill runs.
 
-Worth doing during the backfill, when the data is being written anyway. Retrofitting later means refetching everything.
+Verified in Chromium: selector switches seasons, the Season tab re-renders on
+switch, deep links resolve, week navigation works afterwards, and the
+no-manifest fallback renders with no JS errors.
 
-### GitHub Action
+### The team-identity trap — partially addressed
 
-`YAHOO_LEAGUE_KEY` becomes the *current* season's key. Either update the secret
-each season or — better — drop the secret and let the workflow read
-`seasons.json`, so rollover is a committed file change rather than a secret edit.
+`data.json` keys teams by **display name**, which managers change between
+seasons. Manager `guid` and `team_key` are now captured into each season's
+`teams` block during the fetch, so the identifier is being collected. Nothing
+consumes it yet.
 
----
+**Any future cross-season feature** (all-time records, head-to-head across
+years, a manager's history) must key on `guid`, not team name. Per-season views
+are unaffected.
+
+### Still to do
+
+- Run `discover_leagues.py` then the backfill — **no historical data has been
+  fetched**, only the plumbing exists.
+- Refetch 2025-26 once (`--season 2025-26`): its week 23 is still flagged
+  `is_current` from the final April fetch, so it shows as "(live)" in the
+  picker and is excluded from that season's standings.
+- `YAHOO_LEAGUE_KEY` in the Action is now only a fallback; once
+  `league_keys.json` is committed the workflow reads the current season from it.
 
 ## 7. Track 2 — the draft machine
 
@@ -477,7 +496,7 @@ Get it locally.
 | Repo | Branch | Status |
 |---|---|---|
 | `lacktoes/Thumper_GM` | `claude/quirky-dijkstra-iryhl2` | `analysis/` + this file |
-| `lacktoes/pww-hockey` | `claude/quirky-dijkstra-iryhl2` | `discover_leagues.py`, pushed, **not merged** |
+| `lacktoes/pww-hockey` | `claude/quirky-dijkstra-iryhl2` | `discover_leagues.py`, multi-season pipeline + season selector. Pushed, **not merged** |
 
 Neither repo's `main`/`master` has been touched. No PRs opened.
 
@@ -486,10 +505,12 @@ Neither repo's `main`/`master` has been touched. No PRs opened.
 ## 9. First five things to do locally
 
 1. `python scripts/discover_leagues.py --league 1809` — **does the Yahoo API still work?**
-   Everything branches off this answer.
+   Everything branches off this answer. Then `python scripts/fetch_data.py --list`
+   to confirm the seasons it found.
 2. Read the keeper sheet; get all 24 keepers into a CSV.
 3. Run the Streamlit app once to populate `data/players.db` and `data/schedule.db`.
-4. Start the backfill (it is slow — begin it early, let it run in the background).
+4. Start the backfill — `python scripts/fetch_data.py --backfill --skip-complete`.
+   Slow and resumable; begin it early and let it run in the background.
 5. Re-run `league_diagnostics.py` per backfilled season and check whether the
    faceoff finding holds across years. **This governs the entire draft strategy.**
 
